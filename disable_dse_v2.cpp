@@ -1419,11 +1419,12 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
             kva = 0;
         }
         if (kva) {
-            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes = 0, byte must be 0..0x0F.
-               Real values: 0x00 (disabled), 0x06 (enabled), 0x08 (WinLoad), 0x0E (boot+CI).
-               Tightening from 0x3F to 0x0F rejects code bytes (0x10+) that pass 0x3F check. */
+            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes must be 0, low byte 0..0x3F.
+               Real values: 0x00 (off), 0x06 (DSE on), 0x08 (WinLoad), 0x0E, 0x16, 0x46 (UMCI).
+               Writable-section check (Layer 4) is the primary guard against code-section hits;
+               the value range rejects obviously invalid DWORDs (upper bytes non-zero, etc.). */
             UINT64 cur = 0;
-            if (!kread(kva, 4, &cur) || cur > 0x0F) {
+            if (!kread(kva, 4, &cur) || cur > 0x3F) {
                 logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — out of range, discarding",
                      (unsigned long long)kva, (unsigned long long)cur);
                 kva = 0;
