@@ -98,6 +98,7 @@ static char      g_drvPath[MAX_PATH] = {0};
 static Backend   g_backend  = BE_NONE;
 static BOOL      g_wdac_hard = FALSE; /* set when 1275 persists on Win11 23H2+ after VDB fix */
 static UINT64    g_ntoskrnl_kva = 0; /* set in real_main before bootstrap; used by gdrv SMAP-safe R/W */
+static char      g_randSvc[12]  = {0}; /* randomised service name — avoids GIO/LnvMSRIO/ThrottleStop IoCs */
 
 /* KUSER_SHARED_DATA addresses (fixed on all x64 Windows, not subject to KASLR):
      kernel VA 0xFFFFF78000000000  /  user VA 0x7FFE0000
@@ -172,6 +173,43 @@ static BOOL is_dse_disabled(void) {
     if(g_NtQSI(103,&sci,sizeof(sci),&r)==0) return (sci.CodeIntegrityOptions&0x1)==0;
     return FALSE;
 }
+static void init_rand_svc(void) {
+    if (g_randSvc[0]) return;
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    UINT64 s=((UINT64)ft.dwHighDateTime<<32)|ft.dwLowDateTime;
+    s^=(UINT64)((ULONG_PTR)GetCurrentProcessId()^(ULONG_PTR)GetTickCount())<<17;
+    static const char h[]="abcdefghjkmnpqrs"; /* no i/l/o/u — no lookalikes */
+    for(int i=0;i<8;i++){s=s*6364136223846793005ULL+1442695040888963407ULL;
+        g_randSvc[i]=h[(s>>33)&0xF];}
+    g_randSvc[8]='\0';
+    logf("[*] rand svc name: %s",g_randSvc);
+}
+
+/* Nuke CE's kernel driver before D2 launches — BattleEye scans PsLoadedModuleList
+   for DBKKAIOPROCMON.  We delete both the service entry and the sys file on disk.
+   This runs in MODE_OFF (before CE is started by the launcher). */
+static void nuke_dbk64(void) {
+    SC_HANDLE hScm=OpenSCManagerA(NULL,NULL,SC_MANAGER_ALL_ACCESS);
+    if(hScm){
+        static const char*names[]={"DBKKAIOPROCMON","DBKDRV64","DBK64","dbk64",NULL};
+        for(int i=0;names[i];i++){
+            SC_HANDLE hS=OpenServiceA(hScm,names[i],SERVICE_STOP|DELETE|SERVICE_QUERY_STATUS);
+            if(hS){SERVICE_STATUS ss={0};
+                ControlService(hS,SERVICE_CONTROL_STOP,&ss); Sleep(150);
+                DeleteService(hS); CloseServiceHandle(hS);
+                logf("[+] nuke_dbk64: removed svc %s",names[i]);}
+        }
+        CloseServiceHandle(hScm);
+    }
+    /* Delete sys file — CE will fail to (re)load its driver; our driver does the R/W */
+    char p[MAX_PATH]; GetSystemDirectoryA(p,sizeof(p));
+    strncat(p,"\\drivers\\dbk64.sys",sizeof(p)-strlen(p)-1);
+    if(DeleteFileA(p)) logf("[+] nuke_dbk64: deleted %s",p);
+    /* Also check %TEMP% and CE exe dir — CE drops it there on some versions */
+    GetTempPathA(sizeof(p),p); strncat(p,"dbk64.sys",sizeof(p)-strlen(p)-1);
+    DeleteFileA(p);
+}
+
 static void apply_vdb_hvci_fix(void) {
     run_cmd_hidden("bcdedit /set hypervisorlaunchtype off");
     run_cmd_hidden("bcdedit /set vsmlaunchtype off");
@@ -733,8 +771,7 @@ static DWORD scm_start(const char *svcName) {
             Sleep(400); DeleteService(hS); CloseServiceHandle(hS);
             for(int i=0;i<25;i++){Sleep(100);
                 SC_HANDLE hc=OpenServiceA(hTmp,svcName,SERVICE_QUERY_STATUS);
-                if(!hc) break; CloseServiceHandle(hc);}
-        }
+                if(!hc) break; CloseServiceHandle(hc);}}
         CloseServiceHandle(hTmp);
     }
     g_hScm=OpenSCManagerA(NULL,NULL,SC_MANAGER_ALL_ACCESS);
@@ -817,7 +854,9 @@ open_dev:{
             logf("[!] Cannot open device '%s' err %lu",devPath,GetLastError());
             return GetLastError();
         }
-        logf("[+] device '%s' open.",devPath); return 0;
+        /* kernel holds a ref — file can be deleted while driver stays loaded */
+        DeleteFileA(g_drvPath);
+        logf("[+] device '%s' open, .sys artifact nuked from disk.",devPath); return 0;
     }
 }
 
@@ -839,12 +878,14 @@ static void scm_unload_current(void) {
 static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
     g_backend=be;
     DWORD le=0;
+    /* Regenerate a fresh random name for each backend attempt so stale entries don't collide */
+    init_rand_svc(); g_randSvc[7]=(char)('a'+(be&0xF)); /* backend suffix keeps names distinct */
     if(be==BE_GDRV) {
         if(!drop_driver(GDRV64_SYS_DATA,GDRV64_SYS_SIZE,"_gio")) return 1;
-        le=scm_start(GIO_SVC_NAME);
+        le=scm_start(g_randSvc);
     } else if(be==BE_LNV) {
         if(!drop_companion("LnvMSRIO.sys")) return 1;
-        le=scm_start(LNV_SVC_NAME);
+        le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
                 logf("[!] LNV backend: CR3 not found");
@@ -853,7 +894,7 @@ static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
         }
     } else { /* BE_TS */
         if(!drop_companion("ThrottleStop.sys")) return 1;
-        le=scm_start(TS_SVC_NAME);
+        le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
                 logf("[!] TS backend: CR3 not found");
@@ -1111,17 +1152,87 @@ static UINT64 get_byovd_kva(const char *drv_path) {
     return result;
 }
 
+/* Walk a flat on-disk PE image (mapped to buf) and return the RVA of export 'name'.
+ * Used as fallback when g_ntoskrnl_phys == 0 (gdrv backend). */
+static UINT32 disk_pe_export_rva(const BYTE *buf, SIZE_T bufsz, const char *name) {
+    if (!buf || bufsz < sizeof(IMAGE_DOS_HEADER)) return 0;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER*)buf;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if ((SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > bufsz) return 0;
+    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64*)(buf + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    DWORD edrva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD edsz  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!edrva || !edsz) return 0;
+    /* RVA → file offset via section table */
+    auto rva2off = [&](DWORD rva) -> DWORD {
+        const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+            if (rva >= sec->VirtualAddress && rva < sec->VirtualAddress + sec->Misc.VirtualSize)
+                return rva - sec->VirtualAddress + sec->PointerToRawData;
+        return 0;
+    };
+    DWORD edoff = rva2off(edrva);
+    if (!edoff || edoff + sizeof(IMAGE_EXPORT_DIRECTORY) > bufsz) return 0;
+    const IMAGE_EXPORT_DIRECTORY *ed = (const IMAGE_EXPORT_DIRECTORY*)(buf + edoff);
+    DWORD noff = rva2off(ed->AddressOfNames);
+    DWORD ooff = rva2off(ed->AddressOfNameOrdinals);
+    DWORD foff = rva2off(ed->AddressOfFunctions);
+    if (!noff || !ooff || !foff) return 0;
+    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+        DWORD nrva = ((const DWORD*)(buf + noff))[i];
+        DWORD nfo  = rva2off(nrva);
+        if (!nfo || nfo >= bufsz) continue;
+        if (_stricmp((const char*)(buf + nfo), name) == 0) {
+            WORD ord = ((const WORD*)(buf + ooff))[i];
+            if (ord < ed->NumberOfFunctions) {
+                DWORD frva = ((const DWORD*)(buf + foff))[ord];
+                return frva;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Unlink driver with DllBase==driver_kva from PsLoadedModuleList.
  * KLDR_DATA_TABLE_ENTRY offsets (Win10/11 x64):
  *   +0x000 InLoadOrderLinks.Flink   +0x008 .Blink
  *   +0x030 DllBase (Ptr64)
  * PsLoadedModuleList is an exported DATA symbol in ntoskrnl.exe. */
 static void dkom_unlink_driver(UINT64 driver_kva) {
-    if (!driver_kva || !g_ntoskrnl_kva || !g_ntoskrnl_phys) return;
+    if (!driver_kva || !g_ntoskrnl_kva) return;
 
-    UINT32 rva = phys_pe_export_rva(g_ntoskrnl_phys, "PsLoadedModuleList");
+    UINT32 rva = 0;
+    if (g_ntoskrnl_phys) {
+        rva = phys_pe_export_rva(g_ntoskrnl_phys, "PsLoadedModuleList");
+    } else {
+        /* gdrv path: no physical R/W — read ntoskrnl from disk */
+        char ntpath[MAX_PATH];
+        GetSystemDirectoryA(ntpath, sizeof(ntpath));
+        strncat(ntpath, "\\ntoskrnl.exe", sizeof(ntpath) - strlen(ntpath) - 1);
+        HANDLE hf = CreateFileA(ntpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (hf == INVALID_HANDLE_VALUE) {
+            /* try ntkrnlmp.exe (MP variant) */
+            GetSystemDirectoryA(ntpath, sizeof(ntpath));
+            strncat(ntpath, "\\ntkrnlmp.exe", sizeof(ntpath) - strlen(ntpath) - 1);
+            hf = CreateFileA(ntpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        }
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD fsz = GetFileSize(hf, NULL);
+            BYTE *buf = (BYTE*)malloc(fsz);
+            if (buf) {
+                DWORD rd = 0;
+                ReadFile(hf, buf, fsz, &rd, NULL);
+                if (rd == fsz) rva = disk_pe_export_rva(buf, fsz, "PsLoadedModuleList");
+                free(buf);
+            }
+            CloseHandle(hf);
+        }
+    }
+
     if (!rva) { logf("[!] DKOM: PsLoadedModuleList export not found"); return; }
 
+    logf("[*] DKOM: PsLoadedModuleList RVA=0x%08X (phys_path=%d)", rva, g_ntoskrnl_phys ? 1 : 0);
     UINT64 list_head = g_ntoskrnl_kva + rva;
     logf("[*] DKOM: PsLoadedModuleList @ 0x%016llX", (unsigned long long)list_head);
 
@@ -1275,6 +1386,7 @@ static int real_main(int argc,char **argv){
         if(hf==INVALID_HANDLE_VALUE){logf("[!] -on: state file missing.");return 1;}
         DWORD rd=0; ReadFile(hf,&st,sizeof(st),&rd,NULL); CloseHandle(hf);
         if(rd!=sizeof(st)||!st.kva){logf("[!] -on: state corrupt.");return 1;}
+        init_rand_svc();
         DWORD be=bootstrap_driver(ntoskrnl_kva);
         if(be==2){scm_unload_current();return 2;}
         if(be)  {scm_unload_current();return 1;}
@@ -1285,6 +1397,7 @@ static int real_main(int argc,char **argv){
 
     if(mode==MODE_INTERACTIVE) printf("[*] Loading driver...\n");
 
+    init_rand_svc();
     DWORD be=bootstrap_driver(ntoskrnl_kva);
     if(be==3){
         logf("[!] WDAC permanent block — all backends blocked.");
@@ -1323,6 +1436,7 @@ static int real_main(int argc,char **argv){
             UINT64 byovd_kva = get_byovd_kva(g_drvPath);
             if (byovd_kva) dkom_unlink_driver(byovd_kva);
         }
+        nuke_dbk64(); /* kill CE kernel driver before BattleEye starts */
         char stpath[MAX_PATH]; get_state_path(stpath,sizeof(stpath));
         DSE_STATE st={kva,orig};
         HANDLE hf=CreateFileA(stpath,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
