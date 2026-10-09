@@ -968,18 +968,23 @@ static UINT64 find_ci_options_precise(UINT64 ci_base) {
     if(!img) { logf("[!] precise: MapViewOfFile err=%lu", GetLastError()); return 0; }
 
     UINT64 result = 0;
+    DWORD expRVA = 0;
+    DWORD nNames = 0;
+    DWORD *pNames = NULL;
+    WORD  *pOrds  = NULL;
+    DWORD *pFuncs = NULL;
+    UINT64 ciInit = 0;
 
     /* Find CiInitialize in the mapped image via PE exports */
     DWORD peOff = *(DWORD*)(img + 0x3C);
     if(*(DWORD*)(img + peOff) != 0x00004550 || *(WORD*)(img + peOff + 0x18) != 0x020B)
         { logf("[!] precise: CI.dll PE magic mismatch"); goto done; }
-    DWORD expRVA = *(DWORD*)(img + peOff + 0x18 + 0x70);
+    expRVA = *(DWORD*)(img + peOff + 0x18 + 0x70);
     if(!expRVA) { logf("[!] precise: no export dir"); goto done; }
-    DWORD nNames = *(DWORD*)(img + expRVA + 0x18);
-    DWORD *pNames = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x20));
-    WORD  *pOrds  = (WORD* )(img + *(DWORD*)(img + expRVA + 0x24));
-    DWORD *pFuncs = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x1C));
-    UINT64 ciInit = 0;
+    nNames = *(DWORD*)(img + expRVA + 0x18);
+    pNames = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x20));
+    pOrds  = (WORD* )(img + *(DWORD*)(img + expRVA + 0x24));
+    pFuncs = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x1C));
     for(DWORD i = 0; i < nNames; i++) {
         const char *nm = (const char*)(img + pNames[i]);
         if(strcmp(nm, "CiInitialize") == 0) { ciInit = (UINT64)(img + pFuncs[pOrds[i]]); break; }
@@ -1333,10 +1338,7 @@ static BOOL WINAPI CtrlHandler(DWORD t){(void)t;scm_unload_current();return FALS
 static int real_main(int argc,char **argv);
 int main(int argc,char **argv){
     SetConsoleCtrlHandler(CtrlHandler,TRUE);
-    __try{return real_main(argc,argv);}
-    __except(EXCEPTION_EXECUTE_HANDLER){
-        logf("[!] FATAL 0x%08lX",GetExceptionCode());scm_unload_current();return 1;
-    }
+    return real_main(argc,argv);
 }
 
 static int real_main(int argc,char **argv){
