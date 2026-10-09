@@ -1,0 +1,82 @@
+;
+; DBK64.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=WinDiag64.cat
+DriverVer = 10/08/2026,9.39.24.571
+
+[DestinationDirs]
+DefaultDestDir = 12
+WinDiag64_Device_CoInstaller_CopyFiles = 11
+
+; ================= Class section =====================
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+WinDiag64.sys  = 1,,
+;
+
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%WinDiag64.DeviceDesc%=WinDiag64_Device, Root\WinDiag64
+
+[WinDiag64_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+WinDiag64.sys
+
+;-------------- Service installation
+[WinDiag64_Device.NT.Services]
+AddService = WinDiag64,%SPSVCINST_ASSOCSERVICE%, WinDiag64_Service_Inst
+
+; -------------- WinDiag64 driver install sections
+[WinDiag64_Service_Inst]
+DisplayName    = %WinDiag64.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\WinDiag64.sys
+
+;
+;--- WinDiag64_Device Coinstaller installation ------
+;
+
+[WinDiag64_Device.NT.CoInstallers]
+AddReg=WinDiag64_Device_CoInstaller_AddReg
+CopyFiles=WinDiag64_Device_CoInstaller_CopyFiles
+
+[WinDiag64_Device_CoInstaller_AddReg]
+;
+
+
+[WinDiag64_Device_CoInstaller_CopyFiles]
+;
+
+
+[WinDiag64_Device.NT.Wdf]
+KmdfService =  WinDiag64, WinDiag64_wdfsect
+[WinDiag64_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName="WinDiag Systems"
+ClassName="System"
+DiskName = "WinDiag64 Installation Disk"
+WinDiag64.DeviceDesc = "WinDiag64 Device"
+WinDiag64.SVCDESC = "WinDiag64 Service"
