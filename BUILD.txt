@@ -1,0 +1,45 @@
+BUILD STEPS — D2 Trainer Launcher (System Locker auth)
+========================================================
+
+Prerequisites
+  - VS2019 x64 Native Tools Command Prompt
+  - CE compiled + renamed to loader.exe  → put in CE-Working\
+  - Driver compiled + renamed to d2drv.sys → put in CE-Working\
+  - "disable DSE.exe" in d2\ folder
+  - Destiny420.ct in d2\ folder
+
+No config to fill in — System ID (29dc19ec6062665c38f0) and version (1.0)
+are already hardcoded in launcher.c. No owner ID needed for System Locker
+Simple API — it only needs system + key + hwid.
+
+Step 1: Compile resource file
+  cd C:\Users\Bob\Downloads\d2\launcher
+  rc /fo launcher.res launcher.rc
+
+Step 2: Compile launcher
+  cl /O2 /W3 /GS- launcher.c launcher.res ^
+     /link Winhttp.lib Advapi32.lib Shell32.lib ^
+     /SUBSYSTEM:WINDOWS /out:D2Trainer.exe
+
+Output: D2Trainer.exe (self-contained, includes CE + driver + CT + DSE patcher)
+
+WHAT HAPPENS WHEN USER RUNS IT
+  1. UAC prompts for admin (required for driver)
+  2. Dialog asks for license key
+  3. POST to systemlocker.net/auth/mikros with key + HWID
+     - "true" response → proceeds
+     - Error strings → shows user-friendly message, exits
+  4. Extracts 4 files to %TEMP%\d2_XXXXXXXX\
+  5. Runs DSE patcher (disables DSE)
+  6. Installs + starts driver service "d2svc"
+  7. Runs DSE patcher again (re-enables DSE, before BattleEye)
+  8. Launches CE (loader.exe --load trainer.ct)
+  9. Waits for CE to close
+ 10. Stops + deletes driver service, deletes extracted files
+
+NOTES
+  - Nightflyer offline access is enabled in your SL settings (1440 min = 1 day)
+    so users can play offline after first online auth
+  - HWID lock uses Windows MachineGuid (HKLM\SOFTWARE\Microsoft\Cryptography)
+  - D2 must NOT be running when user launches D2Trainer.exe
+  - After the trainer window appears, user launches D2 normally

@@ -1,0 +1,2 @@
+// disable_dse_v2.rc
+// RTCore64 driver is now embedded inline via rtcore64_bytes.h — no resource needed.

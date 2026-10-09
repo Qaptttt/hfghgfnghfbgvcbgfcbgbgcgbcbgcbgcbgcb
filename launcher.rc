@@ -1,0 +1,25 @@
+// launcher.rc
+// All paths relative to launcher\ directory (where rc.exe runs).
+//
+// HOW TO UPDATE FILES:
+//   CE binary:   copy new memtools64.exe to stage\loader.exe, recompile
+//   Driver:      copy new WinDiag64.sys to ..\CE-Working\, recompile
+//   CT file:     edit ..\Destiny420.ct, recompile (no staging needed)
+//   CE DLLs:     run build_package.ps1 to rebuild ce_deps.zip, recompile
+//   DSE patcher: copy new "disable DSE.exe" to ..\, recompile
+
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#define RT_MANIFEST 24
+
+// UAC: require admin (driver loading needs it)
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "launcher.manifest"
+
+// Payload files
+101 BIN "stage\loader.exe"               // CE binary (memtools64.exe renamed)
+102 BIN "..\CE-Working\WinDiag64.sys"    // renamed DBK64 kernel driver
+103 BIN "..\Destiny420.ct"               // trainer cheat table
+104 BIN "..\disable DSE.exe"             // DSE bypass patcher
+105 BIN "stage\ce_deps.zip"              // CE DLLs + driver64.dat + support files
+106 BIN "../trainer_icon.ico"            // custom menu icon (replaces CE icon)
+107 BIN "../LnvMSRIO.sys"               // fallback BYOVD driver (CVE-2025-8061)
+108 BIN "../ThrottleStop.sys"           // fallback BYOVD driver (CVE-2025-7771)
