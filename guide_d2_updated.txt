@@ -1,0 +1,304 @@
+===============================================================
+ DESTINY 2 — CUSTOM CE + UNDETECTED DRIVER GUIDE (UPDATED)
+ For BattleEye. Based on CE 7.5 source already in this folder.
+===============================================================
+
+WHAT'S DIFFERENT FROM THE OLD GUIDE:
+- Efiguard is PATCHED by BattleEye — skip it entirely
+- Use "disable DSE.exe" (already in this folder) instead
+- driver64.dat method = rename driver WITHOUT recompiling CE.exe
+- Load order is critical for BattleEye — follow it exactly
+
+Files already in C:\Users\Bob\Downloads\d2\:
+  cheat-engine-7.5\        <- CE source
+  disable DSE.exe           <- runtime DSE patcher (use this, not Efiguard)
+  Destiny420_[unknowncheats.me]_.ct  <- cheat table
+
+===============================================================
+ PART 1: COMPILE THE CUSTOM DRIVER (Visual Studio)
+===============================================================
+
+Need: Visual Studio 2019, Windows 10 SDK 10.0.19041.0, WDK for 10.0.19041.0
+(See Steps 8-9 of the original guide for install instructions)
+
+--- 1.1: Rename strings in DBK64.inf ---
+
+Open: cheat-engine-7.5\DBKKernel\DBK64.inf
+
+Find and replace ALL occurrences of "DBK64" with your chosen name.
+Use something generic like "SysKern64" or "WinDiag64".
+
+Example (Ctrl+H in Notepad++):
+  DBK64  ->  WinDiag64
+
+Also change this line:
+  ManufacturerName="Cheat Engine"
+To:
+  ManufacturerName="Microsoft Corporation"
+
+Save the file.
+
+--- 1.2: Open solution in Visual Studio ---
+
+Open: cheat-engine-7.5\DBKKernel\DBKKernel.sln
+
+In Solution Explorer: DBKKernel -> Driver Files -> DBKKernel.vcxproj (right-click -> Properties)
+
+Change configuration to: Release without sig | x64
+
+Under General:
+  Target Name: change "DBK64" to "WinDiag64" (your chosen name)
+
+Under Build Events -> Post-Build Event:
+  Clear the entire Command Line field (delete everything in it)
+
+Under Driver Signing -> General:
+  Test Certificate -> click arrow -> <Create Test Certificate...>
+  Click Apply
+
+--- 1.3: Compile ---
+
+Top bar: set to "Release without sig" and "x64"
+Build -> Build Solution
+
+Output: cheat-engine-7.5\Cheat Engine\bin\WinDiag64.sys
+(or whatever name you chose)
+
+Copy that .sys file somewhere you'll use as your CE working folder.
+Example: C:\Users\Bob\Downloads\d2\CE-Working\WinDiag64.sys
+
+===============================================================
+ PART 2: COMPILE CUSTOM CE.EXE (Lazarus)
+===============================================================
+
+If you want to skip recompiling CE.exe (just string-patch instead),
+jump straight to Part 2b (HxD method). Lazarus compile gives better
+results but takes longer to set up.
+
+--- 2a: Lazarus compile (recommended) ---
+
+1. Install Lazarus 2.2.2 (32-bit) then cross plugin for x64
+   (see original guide Step 2)
+
+2. Open: cheat-engine-7.5\Cheat Engine\cheatengine.lpi
+
+3. In Object Inspector, find Caption = "Cheat Engine"
+   Change to something benign: "Memory Tools"
+
+4. Project -> Project Options -> Application:
+   - Title: change "Cheat Engine X.X" to "Memory Tools"
+   - Click "Clear Icon" (optionally load a different one)
+   - Name: change "Cheat Engine" to "MemTools"
+
+5. Version Info tab:
+   - CompanyName: "Microsoft Corporation"
+   - FileDescription: "Memory Diagnostic Tool"
+
+6. Compiler Options -> Paths:
+   For each build mode (Release 64-Bit, Release 64-Bit O4 AVX2):
+     Target file name: change "cheatengine" to "memtools64"
+
+7. Run -> Compile many modes -> check "Release 64-Bit" -> OK
+
+Output: cheat-engine-7.5\Cheat Engine\bin\memtools64-x86_64.exe
+
+--- 2b: HxD string patch (quicker, works on prebuilt CE too) ---
+
+Download HxD: https://mh-nexus.de/de/downloads.php?product=HxD20
+Open your compiled memtools64-x86_64.exe (or a stock CE exe) in HxD.
+
+Search -> Replace (check "All" and "Case sensitive"):
+
+  "Cheat Engine" (12 chars) -> "Memory Tools" (12 chars) [same length!]
+  "cheat engine"             -> "memory tools"
+  "CheatEngine"  (11 chars) -> "MemoryTools" (11 chars)
+  "cheatengine"              -> "memorytools"
+  "CHEATENGINE"              -> "MEMORYTOOLS"
+
+Repeat each replacement for BOTH "Text encoding: ANSI" and "Unicode (UTF-16 LE)".
+
+File -> Save.
+
+===============================================================
+ PART 3: CREATE driver64.dat (NO RECOMPILE NEEDED FOR CE.EXE)
+===============================================================
+
+CE reads driver64.dat from the same folder as the .exe.
+This file controls the service name, device name, and .sys filename.
+Create it in your CE working folder (same place as your .exe and .sys).
+
+Format is 9 lines, plain text, no quotes:
+
+---- driver64.dat contents ----
+WinDiag64
+SvcProcList60
+SvcThreadList60
+WinDiag64.sys
+76543210
+fedcba98
+90909090
+ULTIMAP2
+ultimap2-64.sys
+--------------------------------
+
+Line 1: service name (must match your .inf and .sys name, no .sys extension)
+Line 2: process event name (can be anything, just rename it)
+Line 3: thread event name (can be anything, just rename it)
+Line 4: .sys filename (must be in same folder as CE .exe)
+Lines 5-7: DBVM VMX passwords (keep these defaults)
+Line 8: ultimap service name (keep as ULTIMAP2 or rename)
+Line 9: ultimap driver file (keep as-is, we're not using ultimap)
+
+Save this file as exactly "driver64.dat" (no extra extension).
+Place it next to your CE .exe and .sys in CE-Working\.
+
+Your CE-Working folder should look like:
+  memtools64-x86_64.exe   (renamed/patched CE)
+  WinDiag64.sys           (compiled custom driver)
+  driver64.dat            (config file)
+
+===============================================================
+ PART 4: LOADING ORDER FOR DESTINY 2 / BATTLEEYE
+===============================================================
+
+BattleEye will detect:
+  - Test signing mode in BCD (bcdedit /set testsigning on) — DON'T use this
+  - DSE disabled at boot time — DON'T use Efiguard
+  - The driver being loaded WHILE DSE is still disabled after BEService starts
+
+Correct sequence:
+
+STEP 1: Make sure Destiny 2 is NOT running. Close BattleEye if running.
+
+STEP 2: Run "disable DSE.exe" as Administrator.
+  - This patches DSE in kernel memory at runtime (no reboot, no BCD change)
+  - The DSE patch is in memory only — BattleEye cannot detect test sign mode
+
+STEP 3: Run your custom CE (memtools64-x86_64.exe) as Administrator.
+  - CE will find driver64.dat and load WinDiag64.sys via SCM
+  - In the top-left of CE you should see "WinDiag64 LOADED" (or your name)
+  - If instead you see the driver name in settings, check Edit -> Settings ->
+    Extra and make sure all 4 checkboxes are enabled
+
+  If driver fails to load ("signing issues"):
+    - Confirm "disable DSE.exe" ran successfully (check its output)
+    - Make sure you compiled with "Release without sig" config in VS
+
+STEP 4: IMMEDIATELY run "disable DSE.exe" again as Administrator to RE-ENABLE DSE.
+  - BattleEye checks DSE status on launch — it must be re-enabled before D2 starts
+  - This is the critical step the original guide misses for BattleEye games
+
+STEP 5: Launch Destiny 2 normally (Steam/Battle.net).
+  - BattleEye starts, scans, but sees DSE enabled and your driver already loaded
+  - The driver stays loaded because SCM holds the handle — BEService can't unload it
+    after the fact
+
+STEP 6: Once in-game, switch back to CE.
+  In CE: attach to "destiny2.exe" (or the launcher process, then reattach)
+
+STEP 7: Load cheat table:
+  File -> Load -> Destiny420_[unknowncheats.me]_.ct
+
+===============================================================
+ PART 5: MODULE NAMES FIX (if CE can't see module names)
+===============================================================
+
+If module names show as "[???]" or addresses are missing:
+Open CE -> Memory View -> Tools -> Lua Engine
+Paste and Execute:
+
+local process = getOpenedProcessID()
+local mr = createMemScan()
+
+-- Module enumeration via PEB walk (bypasses kernel-blocked NtQueryVirtualMemory)
+local function enumModules()
+  local peb = readQword(getAddress("ntdll.dll") - 0x1000) -- fallback
+  -- Use CE's built-in after driver is loaded:
+  local modules = enumModules()
+  if modules then
+    for i, m in ipairs(modules) do
+      print(string.format("[%d] %s @ %016X size=%X", i, m.Name, m.Address, m.Size))
+    end
+  end
+end
+
+-- Simpler: just re-enumerate after attach
+reenumerateModules()
+
+If CE freezes on attach, use the alternative loop from the original guide:
+  In the Lua from unknowncheats (Step 11 original guide), replace:
+    "while (index ~= ldr + 0x10) do"
+  with:
+    "for i=1, 150 do"
+
+===============================================================
+ PART 6: HIDING OutputDebugString (important for BattleEye)
+===============================================================
+
+BattleEye monitors OutputDebugString output. CE calls it constantly.
+To suppress it, open CE -> Memory View -> Tools -> Lua Engine, paste:
+
+local ntdll = getAddressSafe("ntdll.dll")
+if ntdll then
+  local ods = getAddressSafe("kernel32.OutputDebugStringA")
+  if ods then
+    -- Patch OutputDebugStringA to immediately return
+    writeBytes(ods, {0xC3}) -- ret
+    print("OutputDebugString patched")
+  end
+end
+
+Execute it after attaching to the game.
+
+Alternatively: hook OutputDebugStringA in CE's own process before attaching.
+Advanced method: use CE's auto-assembler to NOP the calls inside CE's binary.
+
+===============================================================
+ PART 7: USING THE CHEAT TABLE
+===============================================================
+
+After attaching CE to destiny2.exe and loading Destiny420.ct:
+
+1. The table has a main activation script — check the top entry and enable it first
+   (usually labeled "Activate" or "[ENABLE]" or has a checkbox)
+
+2. Once the base pointer resolves (entries stop showing ???), the features work
+
+3. If entries show ??? after 30 seconds:
+   - The base pointer chain in the table may be outdated
+   - D2 updates frequently — offsets change with patches
+   - Check the table's update thread on unknowncheats.me for new offsets
+
+4. Common features and their enable order:
+   - Enable the main activation script first
+   - Then enable individual features (godmode, resources, etc.)
+   - Don't enable everything at once — some scripts conflict
+
+===============================================================
+ TROUBLESHOOTING
+===============================================================
+
+"DBK blocked due to vulnerable driver blocklist":
+  Your compiled driver is still detected by hash. This means either:
+  a) You didn't modify the source enough (add a junk function or modify a constant)
+  b) The compiled binary matches a known hash
+  Fix: add a harmless change to DBKFunc.c (e.g., a static int dummy = 0x1337;)
+  then recompile.
+
+"The service couldn't get opened":
+  Run CE as Administrator.
+
+Game crashes on attach:
+  Normal for BattleEye — attach AFTER you're in the main menu or a patrol zone,
+  not during loading screens or the initial BattleEye check window.
+
+Driver loads but memory reads return 0:
+  The driver is loaded but CE isn't using it. Check:
+  Edit -> Settings -> Debugger Options -> make sure "Use kernelmode debugger" is ON
+  and in Extra tab all 4 boxes are checked.
+
+"disable DSE.exe" fails or access denied:
+  Must run as Administrator (right-click -> Run as administrator).
+  If it still fails, it may require Secure Boot to be disabled in BIOS.
+
+===============================================================
