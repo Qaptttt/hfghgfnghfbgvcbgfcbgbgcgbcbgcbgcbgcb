@@ -8323,16 +8323,127 @@ alloc(ChamsBase, 8)
 registersymbol(ChamsBase)
 {$lua}
 if syntaxcheck then return end
+
+-- Store the tag address for raw pointer base
 local ct = getAddressSafe("ChamsTag")
 local cb = getAddressSafe("ChamsBase")
 if ct and ct ~= 0 and cb and cb ~= 0 then
   writeQword(cb, ct)
 end
+
+-- ══ WALL ESP / CHAMS ═══════════════════════════════════════════════════════
+-- Scans LocalPlayer's object pool (stride 0x800) for nearby entities.
+-- Writes 1 to entity+CHAMS_GLOW_OFF to force the D2 glow/highlight pass ON.
+-- D2 renders the glow pass AFTER depth clear → shows through all geometry.
+--
+-- CALIBRATING CHAMS_GLOW_OFF (if no visual with default 0x230):
+--   1. Walk near an enemy
+--   2. CE → Add address manually → entity addr from debug print (set ChamsDbgLog=true)
+--   3. Right-click entity addr → Browse this memory region
+--   4. In-game: use Warlock rift / Hunter golden gun near the enemy
+--   5. CE → Unknown → Changed → the DWORD that flipped 0→1 is CHAMS_GLOW_OFF
+--   6. Update the value below (common: 0x1E0, 0x230, 0x238, 0x260)
+_G["CHAMS_GLOW_OFF"] = 0x230   -- ← tune this if no glow
+_G["CHAMS_RADIUS"]   = 600     -- world-unit radius (~600m effective range)
+_G["ChamsRunning"]   = true
+_G["ChamsDbgLog"]    = false   -- set true to print entity addrs to Lua output
+
+-- Silence OutputDebugString so BattleEye debug monitoring sees nothing
+pcall(function()
+  local ods = getAddressSafe("kernel32.OutputDebugStringA")
+  if ods and ods ~= 0 then writeBytes(ods, 0xC3) end
+  ods = getAddressSafe("kernel32.OutputDebugStringW")
+  if ods and ods ~= 0 then writeBytes(ods, 0xC3) end
+end)
+
+local function safeF_c(fn, ...)
+  local ok, v = pcall(fn, ...)
+  return ok and v or nil
+end
+
+local function getLPc()
+  local s = getAddressSafe("LocalPlayer")
+  if not s or s == 0 then return nil end
+  local p = safeF_c(readPointer, s)
+  return (p and p ~= 0) and p or nil
+end
+
+-- get d2 module range for vtable sanity (filters garbage floats at +0x1C0)
+local d2lo, d2hi = 0, 0
+local d2mi = getModuleInfo("destiny2.exe")
+if d2mi then d2lo = d2mi.Address; d2hi = d2mi.Address + d2mi.Size end
+
+local function chamsUpdate()
+  if not _G["ChamsRunning"] then return end
+  local lp = getLPc()
+  if not lp then return end
+  local lpx = safeF_c(readFloat, lp + 0x1C0)
+  if not lpx or lpx ~= lpx then return end
+  local lpy = safeF_c(readFloat, lp + 0x1C4)
+  local lpz = safeF_c(readFloat, lp + 0x1C8)
+  if not lpy or not lpz then return end
+
+  -- find the heap region that contains LP (also holds other entities)
+  local rBase = lp - 0x200000
+  local rSize = 0x400000
+  local ok2, regions = pcall(getMemoryRegions)
+  if ok2 and regions then
+    for i = 0, regions.Count - 1 do
+      local r = regions[i]
+      if r.BaseAddress &lt;= lp and lp &lt; r.BaseAddress + r.RegionSize then
+        rBase = r.BaseAddress; rSize = r.RegionSize; break
+      end
+    end
+    if regions.destroy then regions.destroy() end
+  end
+
+  local GOFF   = _G["CHAMS_GLOW_OFF"]
+  local RAD    = _G["CHAMS_RADIUS"]
+  local stride = 0x800
+  local top    = rBase + rSize - 0x240
+  local addr   = rBase
+  local cnt    = 0
+
+  while addr &lt;= top do
+    if addr ~= lp then
+      -- vtable sanity: qword@+0 must point inside destiny2.exe
+      local vt = safeF_c(readPointer, addr)
+      if vt and vt &gt;= d2lo and vt &lt; d2hi then
+        local ex = safeF_c(readFloat, addr + 0x1C0)
+        if ex and ex == ex and math.abs(ex - lpx) &lt; RAD then
+          local ey = safeF_c(readFloat, addr + 0x1C4)
+          local ez = safeF_c(readFloat, addr + 0x1C8)
+          if ey and ey == ey and ez and ez == ez
+             and math.abs(ey - lpy) &lt; RAD
+             and math.abs(ez - lpz) &lt; RAD then
+            pcall(writeInteger, addr + GOFF,     1)
+            pcall(writeInteger, addr + GOFF + 4, 1)
+            cnt = cnt + 1
+            if _G["ChamsDbgLog"] and cnt &lt;= 8 then
+              print(string.format("[Chams] ent@%X vt@%X pos=(%.0f,%.0f,%.0f) glow@+%X",
+                addr, vt, ex, ey, ez, GOFF))
+            end
+          end
+        end
+      end
+    end
+    addr = addr + stride
+  end
+end
+
+local function chamsLoop()
+  while _G["ChamsRunning"] do
+    chamsUpdate()
+    sleep(50)
+  end
+end
+createNativeThread(chamsLoop)
 {$asm}
 
 [DISABLE]
 {$lua}
 if syntaxcheck then return end
+_G["ChamsRunning"] = false
 local cb = getAddressSafe("ChamsBase")
 if cb and cb ~= 0 then pcall(writeQword, cb, 0) end
 {$asm}
@@ -8913,8 +9024,13 @@ if syntaxcheck then return end
 
 AimbotRunning = true
 local AimbotCache = {}
-local SMOOTH      = 0.10   -- lerp fraction per 8ms tick
-local MAX_TURN    = 0.09   -- max radians per tick ≈ 643°/s; prevents snap detection
+
+-- ══ AIMBOT SETTINGS (tune these) ══════════════════════════════════════════
+local SMOOTH      = 0.10   -- lerp speed     (0.05=butter-smooth, 0.25=aggressive)
+local MAX_TURN    = 0.09   -- max rad/tick   (0.05=subtle, 0.09=default, 0.15=fast)
+local AIMBOT_FOV  = 180    -- FOV cone degs  (180=full, 90=wide, 45=tight, 20=pixel)
+local AIMBOT_RAD  = 400    -- entity radius  world-units (increase for longer ranges)
+-- ══════════════════════════════════════════════════════════════════════════
 
 -- VK_F7 = toggle controller/mouse mode
 -- VK_F8 = rescan entities
@@ -8947,6 +9063,14 @@ local function getLP()
   return (p and p ~= 0) and p or nil
 end
 
+-- d2 module range for vtable sanity check (avoids false-positive entities)
+local aim_d2lo, aim_d2hi = 0, 0
+local aim_d2mi = getModuleInfo("destiny2.exe")
+if aim_d2mi then
+  aim_d2lo = aim_d2mi.Address
+  aim_d2hi = aim_d2mi.Address + aim_d2mi.Size
+end
+
 local function buildEntityCache()
   AimbotCache = {}
   local lp = getLP()
@@ -8975,15 +9099,20 @@ local function buildEntityCache()
   local addr = rBase
   while addr &lt;= top do
     if addr ~= lp then
-      local ex = safeF(readFloat, addr + 0x1C0)
-      if ex and ex == ex and math.abs(ex - lpx) &lt; 400 then
-        local ey = safeF(readFloat, addr + 0x1C4)
-        local ez = safeF(readFloat, addr + 0x1C8)
-        if ey and ey == ey and ez and ez == ez
-           and math.abs(ey - lpy) &lt; 400 and math.abs(ez - lpz) &lt; 400 then
-          local dd = (ex-lpx)^2 + (ey-lpy)^2 + (ez-lpz)^2
-          if dd > 1 then
-            AimbotCache[#AimbotCache+1] = {ex, ey, ez, addr}
+      -- vtable sanity: qword@+0 must point inside d2 image to rule out heap garbage
+      local vt = safeF(readPointer, addr)
+      if vt and vt &gt;= aim_d2lo and vt &lt; aim_d2hi then
+        local ex = safeF(readFloat, addr + 0x1C0)
+        if ex and ex == ex and math.abs(ex - lpx) &lt; AIMBOT_RAD then
+          local ey = safeF(readFloat, addr + 0x1C4)
+          local ez = safeF(readFloat, addr + 0x1C8)
+          if ey and ey == ey and ez and ez == ez
+             and math.abs(ey - lpy) &lt; AIMBOT_RAD
+             and math.abs(ez - lpz) &lt; AIMBOT_RAD then
+            local dd = (ex-lpx)^2 + (ey-lpy)^2 + (ez-lpz)^2
+            if dd > 1 then
+              AimbotCache[#AimbotCache+1] = {ex, ey, ez, addr}
+            end
           end
         end
       end
@@ -9031,10 +9160,32 @@ local function aimLoop()
           local lpy = safeF(readFloat, lp + 0x1C4)
           local lpz = safeF(readFloat, lp + 0x1C8)
           if lpy and lpz then
+            -- build view direction for optional FOV cone filter
+            local vpBaseF = getAddressSafe("ViewAngles")
+            local vpF     = vpBaseF and safeF(readPointer, vpBaseF) or nil
+            local fovYaw   = (vpF and safeF(readFloat, vpF + 0x18)) or 0
+            local fovPitch = (vpF and safeF(readFloat, vpF + 0x1C)) or 0
+            local cpf = math.cos(fovPitch)
+            local vdxF = cpf * math.cos(fovYaw)
+            local vdyF = math.sin(fovPitch)
+            local vdzF = cpf * math.sin(fovYaw)
             local best, bDist = nil, 1e18
             for _, e in ipairs(AimbotCache) do
-              local dd = (e[1]-lpx)^2 + (e[2]-lpy)^2 + (e[3]-lpz)^2
-              if dd &lt; bDist then bDist = dd; best = e end
+              -- FOV filter: skip targets outside the configured cone
+              if AIMBOT_FOV &lt; 180 then
+                local dx2 = e[1]-lpx; local dy2 = e[2]-lpy; local dz2 = e[3]-lpz
+                local d2  = math.sqrt(dx2*dx2 + dy2*dy2 + dz2*dz2)
+                if d2 > 0.01 then
+                  local dot = (vdxF*dx2 + vdyF*dy2 + vdzF*dz2) / d2
+                  local ang = math.deg(math.acos(math.max(-1, math.min(1, dot))))
+                  if ang > AIMBOT_FOV then goto nextEnt end
+                end
+              end
+              do
+                local dd = (e[1]-lpx)^2 + (e[2]-lpy)^2 + (e[3]-lpz)^2
+                if dd &lt; bDist then bDist = dd; best = e end
+              end
+              ::nextEnt::
             end
             if best and aOnAddr and aOnAddr ~= 0 then
               local dx = best[1] - lpx
@@ -9571,6 +9722,50 @@ end)
 {$lua}
 if syntaxcheck then return end
 -- one-way hardening pass — nothing to undo
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>9033</ID>
+      <Description>"ODS Mute [UD — run after attach]"</Description>
+      <Color>FF4400</Color>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Mute kernel32.OutputDebugString(A/W) by patching first byte to 0xC3 (RET).
+-- BattleEye monitors debug string output via DBWIN_BUFFER/DBWIN_DATA named-pipe.
+-- CE writes debug strings constantly (hook installs, AOB hits, symbol resolves).
+-- After this patch every ODS call returns immediately — BE sees silence.
+local function muteODS(sym)
+  local a = getAddressSafe(sym)
+  if not a or a == 0 then return false end
+  local b = readBytes(a, 1, true)
+  if b and b[1] == 0xC3 then return true end  -- already patched
+  local ok = pcall(writeBytes, a, 0xC3)
+  return ok
+end
+-- try common resolution paths (varies by CE version and attach order)
+local muted =
+  muteODS("kernel32.OutputDebugStringA") or
+  muteODS("OutputDebugStringA")          or
+  muteODS("kernel32.dll+OutputDebugStringA")
+muted = muted or
+  muteODS("kernel32.OutputDebugStringW") or
+  muteODS("OutputDebugStringW")          or
+  muteODS("kernel32.dll+OutputDebugStringW")
+_G["ODSMuted"] = muted
+if muted then
+  print("[UD] OutputDebugString muted — BattleEye debug channel silenced")
+else
+  print("[UD] WARN: ODS not patched — try enabling after CE driver loads DBK")
+end
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+-- ODS stays muted for session safety — restoring it would re-expose the channel
+_G["ODSMuted"] = false
 {$asm}
 </AssemblerScript>
     </CheatEntry>
