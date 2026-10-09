@@ -1,45 +1,69 @@
-BUILD STEPS — D2 Trainer Launcher (System Locker auth)
-========================================================
+================================================================
+ D2Trainer Build Guide
+================================================================
 
-Prerequisites
-  - VS2019 x64 Native Tools Command Prompt
-  - CE compiled + renamed to loader.exe  → put in CE-Working\
-  - Driver compiled + renamed to d2drv.sys → put in CE-Working\
-  - "disable DSE.exe" in d2\ folder
-  - Destiny420.ct in d2\ folder
+FOLDER STRUCTURE (after clone)
+--------------------------------
+  D2Trainer_release\
+  |-- disable_dse_v2.cpp       <- DSE patcher source
+  |-- gdrv64_bytes.h           <- embedded driver header
+  |-- build_dse.bat            <- STEP 1: compiles disable DSE.exe
+  |-- build_trainer.bat        <- STEP 2: packs D2Trainer.exe
+  |-- BUILD.txt                <- this file
+  |
+  |-- d2\                      <- launcher payload folder
+  |   |-- disable DSE.exe      <- built by build_dse.bat (auto-copied)
+  |   |-- Destiny420.ct        <- PUT YOUR CT FILE HERE
+  |
+  |-- CE-Working\              <- CE payload folder
+  |   |-- loader.exe           <- PUT YOUR CE BINARY HERE
+  |   |-- d2drv.sys            <- PUT YOUR DRIVER HERE
+  |   |-- LnvMSRIO.sys         <- PUT LENOVO DRIVER HERE (Win11 23H2+)
+  |   |-- ThrottleStop.sys     <- PUT THROTTLESTOP DRIVER HERE (fallback)
+  |
+  |-- launcher\                <- launcher source
+      |-- launcher.c
+      |-- launcher.rc
+      |-- launcher.res         <- built by build_trainer.bat
 
-No config to fill in — System ID (29dc19ec6062665c38f0) and version (1.0)
-are already hardcoded in launcher.c. No owner ID needed for System Locker
-Simple API — it only needs system + key + hwid.
+================================================================
+ REQUIREMENTS
+================================================================
+  - Visual Studio 2019/2022/2026 (x64 Native Tools prompt)
+    OR MinGW-w64 (g++ in PATH)
+  - Windows SDK (included with VS)
 
-Step 1: Compile resource file
-  cd C:\Users\Bob\Downloads\d2\launcher
-  rc /fo launcher.res launcher.rc
+================================================================
+ BUILD STEPS
+================================================================
 
-Step 2: Compile launcher
-  cl /O2 /W3 /GS- launcher.c launcher.res ^
-     /link Winhttp.lib Advapi32.lib Shell32.lib ^
-     /SUBSYSTEM:WINDOWS /out:D2Trainer.exe
+Open "x64 Native Tools Command Prompt" as Administrator, then:
 
-Output: D2Trainer.exe (self-contained, includes CE + driver + CT + DSE patcher)
+  Step 1 - Compile DSE patcher:
+    build_dse.bat
 
-WHAT HAPPENS WHEN USER RUNS IT
-  1. UAC prompts for admin (required for driver)
-  2. Dialog asks for license key
-  3. POST to systemlocker.net/auth/mikros with key + HWID
-     - "true" response → proceeds
-     - Error strings → shows user-friendly message, exits
-  4. Extracts 4 files to %TEMP%\d2_XXXXXXXX\
-  5. Runs DSE patcher (disables DSE)
-  6. Installs + starts driver service "d2svc"
-  7. Runs DSE patcher again (re-enables DSE, before BattleEye)
-  8. Launches CE (loader.exe --load trainer.ct)
-  9. Waits for CE to close
- 10. Stops + deletes driver service, deletes extracted files
+  Step 2 - Pack D2Trainer.exe:
+    build_trainer.bat
 
-NOTES
-  - Nightflyer offline access is enabled in your SL settings (1440 min = 1 day)
-    so users can play offline after first online auth
-  - HWID lock uses Windows MachineGuid (HKLM\SOFTWARE\Microsoft\Cryptography)
-  - D2 must NOT be running when user launches D2Trainer.exe
-  - After the trainer window appears, user launches D2 normally
+Output: D2Trainer.exe  (give this to users)
+
+================================================================
+ WHAT D2Trainer.exe DOES WHEN USER RUNS IT
+================================================================
+  1. UAC prompt (needs admin for driver)
+  2. License key dialog
+  3. Auth check via systemlocker.net
+  4. Extracts files to %TEMP%\d2_XXXXXXXX\
+  5. Runs disable DSE.exe -off  (patches g_CiOptions)
+  6. Loads d2drv.sys
+  7. Runs disable DSE.exe -on   (restores DSE before BattleEye)
+  8. Launches CE with Destiny420.ct
+  9. On CE close: unloads driver, cleans up
+
+================================================================
+ NOTES
+================================================================
+  - LnvMSRIO.sys / ThrottleStop.sys needed for Win11 23H2/24H2/25H2
+  - gdrv.sys is embedded in disable_dse_v2.cpp (no separate file)
+  - Users just turn off Real-Time Protection + Core Isolation
+  - D2 must NOT be running when launching D2Trainer.exe
