@@ -41,9 +41,9 @@
 #include <stdint.h>
 
 /* ── Embedded gdrv.sys ────────────────────────────────────────────────────── */
-#include "..\GDRVLoader-Release\src\driverbytes.h"
-#define GDRV64_SYS_DATA  shell_mapper
-#define GDRV64_SYS_SIZE  ((DWORD)sizeof(shell_mapper))
+#include "gdrv64_bytes.h"
+/* gdrv64_bytes.h defines GDRV64_SYS_DATA[] directly */
+#define GDRV64_SYS_SIZE  ((DWORD)sizeof(GDRV64_SYS_DATA))
 
 /* ══════════════════════════════════════════════════════════════════════════
  * BACKEND DEFINITIONS
