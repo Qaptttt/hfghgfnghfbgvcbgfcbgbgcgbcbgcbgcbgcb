@@ -410,6 +410,17 @@ static int prompt_key(HINSTANCE hInst) {
     return g_authOK && g_key[0];
 }
 
+/* Shared stealth tag — generated once, applied to both driver and CE binary */
+static char g_stealth_tag[6];
+
+static void gen_stealth_tag(void) {
+    const char *pool = "ABCDEFGHJKLMNPRSTUVWXYZ";
+    DWORD seed = GetTickCount() ^ GetCurrentProcessId();
+    srand(seed);
+    for (int i = 0; i < 5; i++) g_stealth_tag[i] = pool[rand() % 23];
+    g_stealth_tag[5] = '\0';
+}
+
 /* ===== EXTRACT RESOURCE ===== */
 static int extract_res(HINSTANCE hInst, int id, const char *path) {
     HRSRC   hr  = FindResourceA(hInst,MAKEINTRESOURCEA(id),"BIN");
@@ -425,6 +436,52 @@ static int extract_res(HINSTANCE hInst, int id, const char *path) {
     WriteFile(hf,ptr,sz,&written,NULL);
     CloseHandle(hf);
     return (written==sz);
+}
+
+/* Forward declarations for stealth helpers defined later in this file */
+static BOOL file_write_all(const char *path, const BYTE *buf, DWORD sz);
+static void replace_ansi(BYTE *buf, DWORD sz, const char *old5, const char *new5);
+static void replace_wide(BYTE *buf, DWORD sz, const wchar_t *old5, const wchar_t *new5);
+
+/* Extract a driver resource, apply g_stealth_tag patch in-memory BEFORE writing.
+   AV never sees the original bytes — the file that hits disk is already stealthed. */
+static int extract_res_stealthed(HINSTANCE hInst, int id, const char *path) {
+    HRSRC   hr  = FindResourceA(hInst,MAKEINTRESOURCEA(id),"BIN");
+    if (!hr) return 0;
+    HGLOBAL hg  = LoadResource(hInst,hr);
+    DWORD   sz  = SizeofResource(hInst,hr);
+    void   *src = LockResource(hg);
+    if (!src||sz==0) return 0;
+    BYTE *buf = (BYTE*)malloc(sz);
+    if (!buf) return 0;
+    memcpy(buf,src,sz);
+
+    /* patch PE timestamps (unique hash per run) */
+    if (sz >= 0x40) {
+        DWORD peOff=*(DWORD*)(buf+0x3C);
+        if (peOff+0x60<=sz && *(DWORD*)(buf+peOff)==0x00004550) {
+            *(DWORD*)(buf+peOff+8)=GetTickCount()^GetCurrentProcessId()^(DWORD)(ULONG_PTR)buf;
+            WORD optMg=*(WORD*)(buf+peOff+0x18);
+            DWORD csOff=peOff+0x18+((optMg==0x20B)?0x40:0x40);
+            if (csOff+4<=sz) *(DWORD*)(buf+csOff)=0;
+            DWORD ddBase=peOff+0x18+((optMg==0x20B)?0x70:0x60);
+            DWORD dbgOff=ddBase+6*8;
+            if (dbgOff+8<=sz){*(DWORD*)(buf+dbgOff)=0;*(DWORD*)(buf+dbgOff+4)=0;}
+        }
+    }
+
+    /* replace DBK64/DBK32 device name (ANSI + wide) with g_stealth_tag */
+    wchar_t wOld64[6]={L'D',L'B',L'K',L'6',L'4',0};
+    wchar_t wOld32[6]={L'D',L'B',L'K',L'3',L'2',0};
+    wchar_t wNew[6]; for(int i=0;i<5;i++) wNew[i]=(wchar_t)(unsigned char)g_stealth_tag[i]; wNew[5]=0;
+    replace_ansi(buf,sz,"DBK64",g_stealth_tag);
+    replace_ansi(buf,sz,"DBK32",g_stealth_tag);
+    replace_wide(buf,sz,wOld64,wNew);
+    replace_wide(buf,sz,wOld32,wNew);
+
+    BOOL ok = file_write_all(path,buf,sz);
+    free(buf);
+    return ok?1:0;
 }
 
 /* ===== UNZIP ===== */
@@ -923,36 +980,20 @@ static void replace_wide(BYTE *buf, DWORD sz, const wchar_t *old5, const wchar_t
         if (memcmp(buf + i, old5, 10) == 0) { memcpy(buf + i, new5, 10); i += 9; }
 }
 
-/* Patch DBK device name strings in both the driver and CE binary so each run
-   has a unique driver identity that doesn't match BattlEye's DBK signature list.
-   Both files get the SAME tag so CE can still open the renamed device. */
-static void stealth_patch(const char *drvPath, const char *cePath) {
-    /* 5-char random uppercase tag — same length as "DBK64" / "DBK32" */
-    const char *pool = "ABCDEFGHJKLMNPRSTUVWXYZ";
-    char tag[6];
-    DWORD seed = GetTickCount() ^ GetCurrentProcessId();
-    srand(seed);
-    for (int i = 0; i < 5; i++) tag[i] = pool[rand() % 23];
-    tag[5] = '\0';
-
-    wchar_t wOld64[6] = {L'D',L'B',L'K',L'6',L'4',L'\0'};
-    wchar_t wOld32[6] = {L'D',L'B',L'K',L'3',L'2',L'\0'};
-    wchar_t wNew[6];
-    for (int i = 0; i < 5; i++) wNew[i] = (wchar_t)(unsigned char)tag[i];
-    wNew[5] = L'\0';
-
-    const char *paths[2] = { drvPath, cePath };
-    for (int f = 0; f < 2; f++) {
-        BYTE *buf = NULL; DWORD sz = 0;
-        if (!file_read_all(paths[f], &buf, &sz)) continue;
-        if (f == 0) patch_pe_timestamps(buf, sz);      /* driver only */
-        replace_ansi(buf, sz, "DBK64", tag);
-        replace_ansi(buf, sz, "DBK32", tag);
-        replace_wide(buf, sz, wOld64, wNew);
-        replace_wide(buf, sz, wOld32, wNew);
-        file_write_all(paths[f], buf, sz);
-        free(buf);
-    }
+/* Patch DBK device name strings in the CE binary using g_stealth_tag.
+   Driver is already patched in-memory by extract_res_stealthed — no disk read-back. */
+static void stealth_patch(const char *cePath) {
+    wchar_t wOld64[6]={L'D',L'B',L'K',L'6',L'4',0};
+    wchar_t wOld32[6]={L'D',L'B',L'K',L'3',L'2',0};
+    wchar_t wNew[6]; for(int i=0;i<5;i++) wNew[i]=(wchar_t)(unsigned char)g_stealth_tag[i]; wNew[5]=0;
+    BYTE *buf=NULL; DWORD sz=0;
+    if (!file_read_all(cePath,&buf,&sz)) return;
+    replace_ansi(buf,sz,"DBK64",g_stealth_tag);
+    replace_ansi(buf,sz,"DBK32",g_stealth_tag);
+    replace_wide(buf,sz,wOld64,wNew);
+    replace_wide(buf,sz,wOld32,wNew);
+    file_write_all(cePath,buf,sz);
+    free(buf);
 }
 
 /* ===== BASIC HWID SPOOF — rotate MachineGuid before game launch ===== */
@@ -1142,12 +1183,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     snprintf(lnv,  sizeof(lnv),  "%s\\LnvMSRIO.sys",     dir);
     snprintf(ts,   sizeof(ts),   "%s\\ThrottleStop.sys",  dir);
 
+    /* Generate stealth tag BEFORE any extraction — driver is patched in-memory,
+       so AV never sees the original bytes land on disk. */
+    gen_stealth_tag();
+
     #define CHK(call, label) do { if (!(call)) { \
         char _em[256]; snprintf(_em,sizeof(_em),"Step failed: %s\nError: %lu",label,GetLastError()); \
         MessageBoxA(NULL,_em,"BOBS D2 MENU",MB_ICONERROR); goto clean; } } while(0)
 
-    CHK(extract_res(hInst,RES_CE_EXE, ce),   "extract " CE_PROC_NAME);
-    CHK(extract_res(hInst,RES_DRIVER,  drv),  "extract WinDiag64.sys");
+    CHK(extract_res(hInst,RES_CE_EXE, ce),              "extract " CE_PROC_NAME);
+    CHK(extract_res_stealthed(hInst,RES_DRIVER, drv),   "extract WinDiag64.sys");
     CHK(extract_res(hInst,RES_CT_FILE, ct),   "extract trainer.ct");
     CHK(extract_res(hInst,RES_DSE_EXE, dse),  "extract dsepatch.exe");
     CHK(extract_res(hInst,RES_CE_DEPS, deps), "extract ce_deps.zip");
@@ -1160,9 +1205,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     CHK(unzip_to_dir(deps, dir),              "unzip ce_deps.zip");
     DeleteFileA(deps);
 
-    /* Patch DBK device name strings to unique random tag in both driver + CE binary.
-       Also randomizes PE timestamps/checksum so each run has a unique driver hash. */
-    stealth_patch(drv, ce);
+    /* Patch DBK device name strings in CE binary (driver already patched in extract_res_stealthed). */
+    stealth_patch(ce);
 
     /* Pre-flight: check for HVCI / Smart App Control before wasting time on DSE bypass */
     if (check_driver_blockers()) goto clean;
