@@ -898,7 +898,7 @@ end
 w("--- EXACT PATTERNS (CT AOBs) ---")
 local exact = {
   -- Patterns pulled directly from CT aobscan() calls — these are what actually runs
-  {"LocalPlayer",    "0F 10 89 C0 01 00 00 0F 54 0D"},
+  {"LocalPlayer",    "0F 10 89 C0 01 00 00 0F 54 0D 27"},  -- +27 picks d2+266B4B (was E7@C8C6AB)
   {"NoRecoil",       "0F 11 8B C4 01 00 00 8B 87 30 01 00 00"},  -- recoil offset 0x01C4
   {"AbilityRegen",   "0F 28 C1 F3 41 0F 5C C3 0F 2F C6 73"},
   -- AbilityRate has no aobscan — it writes AbilityValue float via Lua, depends on AbilityRegen (ID 350)
@@ -927,15 +927,15 @@ local exact = {
   {"FoV2",           "F3 0F 10 4B 10 F3 0F 10 43"},
   {"FoV3",           "DEAD"},  -- rdi offset still not found in current build
   {"ShieldSize",     "C6 F3 0F 10 B3 D4 00 00 00 48"},  -- d2+A8792  offset B8→D4 (leading C6)
-  {"Damage2",        "F3 44 0F 10 61 08 44 0F 29 A8 68 FF FF FF 45 0F 57 ED"},  -- d2+1747F05 offset 24→08
+  {"Damage2",        "F3 44 0F 10 61 08 44 0F 29 A8 68 FF FF FF 45 0F 57 ED"},  -- DUP(2) identical sites @d2+1747F05+174915E; CE picks first (OK)
   {"Orb2",           "DEAD"},  -- no reliable pattern in current build
-  {"TurboCrash",     "C7 43 04 FF FF FF FF C6 03 01"},
-  {"Timers",         "48 89 8B A0 00 00 00 48 8D 4C 24 30"},
+  {"TurboCrash",     "C7 43 04 FF FF FF FF C6 03 01 48 83 C4 20 5B C3 49"},  -- +49 picks d2+1630374 (was 8B84@16431E4)
+  {"Timers",         "48 89 8B A0 00 00 00 48 8D 4C 24 30 E8 92"},  -- +E8 92 picks d2+B80B6D (was dead)
   {"PlayerSpeed",    "0F 10 47 04 48 8B 7C 24 38 48 83 C4 20 5B C3 F3"},
   -- InfAmmo uses pointer chain (no AOB), depends on LocalPlayer
   {"ViewAngles",     "F3 0F 11 47 1C 7A"},
   -- Freecam hook
-  {"Freecam",        "89 01 48 8D 49 04 49 83 E8 01 75 F1 EB 2E"},  -- d2+528CB3 (was 48→EB)
+  {"Freecam",        "1F 40 00 8B 04 0A 89 01 48 8D 49 04 49 83 E8 01 75 F1 EB 2E"},  -- prefix-anchored to d2+528CB3
   -- pSticky base unique: 50 CD suffix selects d2+287F1A8
   {"pStickyBase",    "90 95 80 80 00 00 00 00 50 CD"},
   -- Chams base unique: 10 BF suffix selects d2+287EAB8
@@ -1395,7 +1395,7 @@ unregistersymbol(Player)
           <VariableType>Auto Assembler Script</VariableType>
           <AssemblerScript>{Alura New Local Player}
 [ENABLE]
-aobscan(INJECT,0F 10 89 C0 01 00 00 0F 54 0D E7) // unique: d2+C8C6AB
+aobscan(INJECT,0F 10 89 C0 01 00 00 0F 54 0D 27) // unique: d2+266B4B (was E7@C8C6AB)
 alloc(newmem,$1000,INJECT)
 registersymbol(LocalPlayer)
 alloc(LocalPlayer, 8)
@@ -2804,7 +2804,7 @@ destiny2.exe+14BEB0D: C7 02 FF FF FF FF  - mov [rdx],FFFFFFFF
 
 [ENABLE]
 
-aobscan(INJECT,C7 43 04 FF FF FF FF C6 03 01 48 83 C4 20 5B C3 8B 84) // d2+16431E4
+aobscan(INJECT,C7 43 04 FF FF FF FF C6 03 01 48 83 C4 20 5B C3 49) // d2+1630374 (was 8B84@16431E4)
 alloc(newmem,$1000,INJECT)
 
 label(code)
@@ -2868,7 +2868,7 @@ destiny2.exe+132E18B: 48 83 C1 04           - add rcx,04
 {$lua}
 if syntaxcheck then return end
 -- pattern dead as of last scan; guard so aobscan failure doesn't leave dangling labels
-local r = AOBScan("48 89 8B A0 00 00 00 48 8D 4C 24 30")
+local r = AOBScan("48 89 8B A0 00 00 00 48 8D 4C 24 30 E8 92") -- +E8 92 picks d2+B80B6D
 if not r or r.Count == 0 then
   if r then r.destroy() end
   error("Timers pattern NOMATCH - needs rescan")
@@ -8380,7 +8380,19 @@ dealloc(ChamsBase)
           <Color>808080</Color>
           <VariableType>Auto Assembler Script</VariableType>
           <AssemblerScript>[ENABLE]
-aobscan(INJECT,89 01 48 8D 49 04 49 83 E8 01 75 F1 EB 2E) // d2+492823 unique suffix
+{$lua}
+if syntaxcheck then return end
+-- DUP(5): all copies have identical bytes; anchor on unique prefix 1F 40 00 at d2+528CB3
+local r = AOBScan("1F 40 00 8B 04 0A 89 01 48 8D 49 04 49 83 E8 01 75 F1 EB 2E")
+if not r or r.Count == 0 then
+  if r then r.destroy() end
+  error("Freecam: pattern not found (prefix 1F 40 00 gone, rescan needed)")
+end
+local addr = tonumber(r[0], 16) + 6  -- skip 6 prefix bytes to land on 89 01
+r.destroy()
+if not addr or addr == 0 then error("Freecam: addr=0") end
+registerSymbol("INJECT", addr)
+{$asm}
 alloc(newmem,$1000,INJECT)
 label(code)
 label(return)
@@ -8396,7 +8408,6 @@ INJECT:
   jmp newmem
   nop
 return:
-registersymbol(INJECT)
 
 [DISABLE]
 
@@ -8424,7 +8435,7 @@ dealloc(newmem)
               <VariableType>Auto Assembler Script</VariableType>
               <AssemblerScript>{Alura New Local Player}
 [ENABLE]
-aobscan(INJECT,0F 10 89 C0 01 00 00 0F 54 0D E7) // unique: d2+C8C6AB
+aobscan(INJECT,0F 10 89 C0 01 00 00 0F 54 0D 27) // unique: d2+266B4B (was E7@C8C6AB)
 alloc(newmem,$1000,INJECT)
 registersymbol(LocalPlayer)
 alloc(LocalPlayer, 8)
