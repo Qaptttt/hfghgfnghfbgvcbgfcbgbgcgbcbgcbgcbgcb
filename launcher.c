@@ -1143,9 +1143,39 @@ static void cleanup_dir(const char *dir) {
     RemoveDirectoryA(dir);
 }
 
+/* ===== ADMIN SELF-ELEVATION ===== */
+static BOOL is_admin(void) {
+    BOOL admin = FALSE;
+    HANDLE hTok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) return FALSE;
+    TOKEN_ELEVATION te = {0};
+    DWORD sz = 0;
+    if (GetTokenInformation(hTok, TokenElevation, &te, sizeof(te), &sz))
+        admin = te.TokenIsElevated;
+    CloseHandle(hTok);
+    return admin;
+}
+
+static void relaunch_as_admin(void) {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, sizeof(path));
+    SHELLEXECUTEINFOA sei = {0};
+    sei.cbSize = sizeof(sei);
+    sei.lpVerb = "runas";
+    sei.lpFile = path;
+    sei.nShow  = SW_SHOWNORMAL;
+    ShellExecuteExA(&sei);
+}
+
 /* ===== MAIN ===== */
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     (void)hPrev; (void)lp; (void)nShow;
+
+    /* Must run as admin for driver load + DSE bypass */
+    if (!is_admin()) {
+        relaunch_as_admin();
+        return 0;
+    }
 
     get_hwid(g_hwid, sizeof(g_hwid));
 
@@ -1183,15 +1213,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     snprintf(lnv,  sizeof(lnv),  "%s\\LnvMSRIO.sys",     dir);
     snprintf(ts,   sizeof(ts),   "%s\\ThrottleStop.sys",  dir);
 
-    /* Generate stealth tag BEFORE any extraction — driver is patched in-memory,
-       so AV never sees the original bytes land on disk. */
     gen_stealth_tag();
+
+    /* Kill AV BEFORE anything touches disk — Defender quarantines files
+       on write, so disable it first, then extract. */
+    disable_defender_rt();
+    disable_vdb();
+    Sleep(1500);  /* wait for policy change to propagate */
 
     #define CHK(call, label) do { if (!(call)) { \
         char _em[256]; snprintf(_em,sizeof(_em),"Step failed: %s\nError: %lu",label,GetLastError()); \
         MessageBoxA(NULL,_em,"BOBS D2 MENU",MB_ICONERROR); goto clean; } } while(0)
 
-    CHK(extract_res(hInst,RES_CE_EXE, ce),              "extract " CE_PROC_NAME);
+    /* Both CE binary and driver extracted with in-memory stealth patch —
+       PE timestamp randomized + DBK device name replaced before disk write. */
+    CHK(extract_res_stealthed(hInst,RES_CE_EXE, ce),    "extract " CE_PROC_NAME);
     CHK(extract_res_stealthed(hInst,RES_DRIVER, drv),   "extract WinDiag64.sys");
     CHK(extract_res(hInst,RES_CT_FILE, ct),   "extract trainer.ct");
     CHK(extract_res(hInst,RES_DSE_EXE, dse),  "extract dsepatch.exe");
@@ -1213,13 +1249,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     /* Rotate MachineGuid before D2/BE ever runs — restored on exit */
     spoof_hwid();
-
-    /* Disable Defender real-time + VDB before touching the kernel driver.
-       Defender kills DSE.exe mid-patch on Win11; VDB blocks the vulnerable
-       driver it uses. Both are restored in cleanup. */
-    disable_defender_rt();
-    disable_vdb();
-    Sleep(1200);  /* give Defender ~1200ms to read the policy change before touching kernel */
 
     {
         DWORD dseErr = run_dse(dse, 0);
