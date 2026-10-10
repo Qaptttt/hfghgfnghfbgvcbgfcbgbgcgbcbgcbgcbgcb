@@ -1,0 +1,8 @@
+# build outputs
+D2Trainer.exe
+D2Trainer_new.exe
+*.o
+*.res
+launcher_build.res
+launcher_build.o
+disable_dse_v2.obj
