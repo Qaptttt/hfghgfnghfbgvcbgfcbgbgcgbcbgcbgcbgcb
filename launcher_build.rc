@@ -1,0 +1,14 @@
+// launcher_build.rc - paths adjusted for Linux cross-compile from repo root
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#define RT_MANIFEST 24
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "launcher.manifest"
+
+101 BIN "stage/loader.exe"
+102 BIN "WinDiag64.sys"
+103 BIN "Destiny420.ct"
+104 BIN "disable DSE.exe"
+105 BIN "stage/ce_deps.zip"
+106 BIN "trainer_icon.ico"
+107 BIN "LnvMSRIO.sys"
+108 BIN "ThrottleStop.sys"
