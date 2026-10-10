@@ -1233,9 +1233,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     CHK(extract_res(hInst,RES_DSE_EXE, dse),  "extract dsepatch.exe");
     CHK(extract_res(hInst,RES_CE_DEPS, deps), "extract ce_deps.zip");
     extract_res(hInst, RES_BIN_ICON, ico);    /* icon — best effort, non-fatal */
-    /* LNV/TS companion drivers for Win11 23H2+ — non-fatal if resources not yet embedded */
-    extract_res(hInst, RES_LNV_DRV, lnv);
-    extract_res(hInst, RES_TS_DRV,  ts);
+    /* LNV/TS companion drivers for Win11 23H2+ — stealthed so AV doesn't kill them */
+    extract_res_stealthed(hInst, RES_LNV_DRV, lnv);
+    extract_res_stealthed(hInst, RES_TS_DRV,  ts);
     patch_exe_icon(ce, ico);                  /* replace CE icon in extracted binary */
     /* icon.ico stays on disk — Lua loads it for the trainer window icon */
     CHK(unzip_to_dir(deps, dir),              "unzip ce_deps.zip");
