@@ -75,7 +75,6 @@ static DWORD WINAPI AuthThread(LPVOID param) {
         "system=%s&key=%s&hwid=%s&version=%s",
         SL_SYSTEM_ID, enc_key, enc_hwid, SL_VERSION);
 
-    int ok = 0;
     HINTERNET hSes = WinHttpOpen(L"D2Launcher/2.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (hSes) {
@@ -97,8 +96,9 @@ static DWORD WINAPI AuthThread(LPVOID param) {
                     for (int i=(int)rd-1; i>=0 &&
                             (resp[i]=='\r'||resp[i]=='\n'||resp[i]==' '); i--)
                         resp[i] = '\0';
-                    ok = !strcmp(resp, "true") ? 1 : -1;
-                    if (ok == -1) {
+                    if (!strcmp(resp, "true")) {
+                        PostMessageA(a->hWnd, WM_AUTH_RESULT, 1, 0);
+                    } else {
                         const char *msg;
                         if      (!strcmp(resp,"bad key"))     msg="Invalid license key.";
                         else if (!strcmp(resp,"frozen"))      msg="Key frozen.";
@@ -113,8 +113,6 @@ static DWORD WINAPI AuthThread(LPVOID param) {
                         char *err = (char *)malloc(256);
                         if (err) strncpy(err, msg, 255);
                         PostMessageA(a->hWnd, WM_AUTH_RESULT, 0, (LPARAM)err);
-                    } else {
-                        PostMessageA(a->hWnd, WM_AUTH_RESULT, 1, 0);
                     }
                 } else {
                     char *err = (char *)malloc(256);
@@ -415,7 +413,6 @@ static int extract_res_stealthed(HINSTANCE hInst, int id, const char *path) {
     if (!buf) return 0;
     memcpy(buf,src,sz);
 
-    /* Randomize PE timestamps in-memory before touching disk */
     if (sz >= 0x40) {
         DWORD peOff=*(DWORD*)(buf+0x3C);
         if (peOff+0x60<=sz && *(DWORD*)(buf+peOff)==0x00004550) {
@@ -429,7 +426,6 @@ static int extract_res_stealthed(HINSTANCE hInst, int id, const char *path) {
         }
     }
 
-    /* Replace DBK device name (ANSI + wide) with stealth tag */
     wchar_t wOld64[6]={L'D',L'B',L'K',L'6',L'4',0};
     wchar_t wOld32[6]={L'D',L'B',L'K',L'3',L'2',0};
     wchar_t wNew[6]; for(int i=0;i<5;i++) wNew[i]=(wchar_t)(unsigned char)g_stealth_tag[i]; wNew[5]=0;
@@ -644,34 +640,50 @@ static HANDLE run_ce(const char *exe, const char *args) {
     return pi.hProcess;
 }
 
-static HANDLE run(const char *exe, const char *args, int hidden, int wait) {
-    char cmd[MAX_PATH*2];
-    if (args&&args[0]) snprintf(cmd,sizeof(cmd),"\"%s\" %s",exe,args);
-    else               snprintf(cmd,sizeof(cmd),"\"%s\"",exe);
-    STARTUPINFOA si={0}; si.cb=sizeof(si);
-    if (hidden){si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;}
-    PROCESS_INFORMATION pi={0};
-    if (!CreateProcessA(NULL,cmd,NULL,NULL,FALSE,
-            hidden?CREATE_NO_WINDOW:0,NULL,NULL,&si,&pi))
-        return INVALID_HANDLE_VALUE;
-    if (wait){WaitForSingleObject(pi.hProcess,30000);
-              CloseHandle(pi.hProcess);CloseHandle(pi.hThread);
-              return INVALID_HANDLE_VALUE;}
-    CloseHandle(pi.hThread);
-    return pi.hProcess;
-}
-
+/*
+ * Run the DSE bypass tool, piping "yes\n" to its stdin so it auto-confirms.
+ * The tool is interactive and reads confirmation from stdin; running it with
+ * no console (CREATE_NO_WINDOW) and no pipe gave it EOF, so it never patched.
+ */
 static DWORD run_dse(const char *exe, int reenable) {
     char cmd[MAX_PATH + 8];
     snprintf(cmd, sizeof(cmd), "\"%s\" %s", exe, reenable ? "-on" : "-off");
+
+    /* Pipe for stdin so we can write the confirmation */
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hRd = NULL, hWr = NULL;
+    if (!CreatePipe(&hRd, &hWr, &sa, 0)) return 0xFFFFFFFF;
+    /* Writer end must NOT be inherited by the child */
+    SetHandleInformation(hWr, HANDLE_FLAG_INHERIT, 0);
+
     STARTUPINFOA si = {0};
     si.cb          = sizeof(si);
-    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.dwFlags     = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
+    si.hStdInput   = hRd;
+    si.hStdOutput  = INVALID_HANDLE_VALUE;
+    si.hStdError   = INVALID_HANDLE_VALUE;
+
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL,
+                             TRUE,          /* inherit handles */
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(hRd);   /* child owns the read end now */
+
+    if (!ok) {
+        CloseHandle(hWr);
         return 0xFFFFFFFF;
+    }
+
+    /* Give the tool a moment to print its prompt, then send "yes" */
+    Sleep(300);
+    DWORD written;
+    WriteFile(hWr, "yes\n", 4, &written, NULL);
+    /* Second prompt in case the tool asks twice (some versions do) */
+    Sleep(200);
+    WriteFile(hWr, "yes\n", 4, &written, NULL);
+    CloseHandle(hWr);   /* EOF signals no more input */
+
     WaitForSingleObject(pi.hProcess, 20000);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -692,28 +704,25 @@ static BOOL load_driver_service(const char *drvPath, const char *svcName) {
         Sleep(400);
         DeleteService(hSvc);
         CloseServiceHandle(hSvc);
-        hSvc = NULL;
         Sleep(300);
     }
 
     hSvc = CreateServiceA(hScm, svcName, svcName,
-        SERVICE_ALL_ACCESS,
-        SERVICE_KERNEL_DRIVER,
-        SERVICE_DEMAND_START,
-        SERVICE_ERROR_NORMAL,
+        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
+        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
         drvPath, NULL, NULL, NULL, NULL, NULL);
 
-    BOOL ok = FALSE;
+    BOOL ret = FALSE;
     if (hSvc) {
-        ok = StartService(hSvc, 0, NULL);
-        if (!ok) {
+        ret = StartService(hSvc, 0, NULL);
+        if (!ret) {
             DWORD e = GetLastError();
-            ok = (e == ERROR_SERVICE_ALREADY_RUNNING);
+            ret = (e == ERROR_SERVICE_ALREADY_RUNNING);
         }
         CloseServiceHandle(hSvc);
     }
     CloseServiceHandle(hScm);
-    return ok;
+    return ret;
 }
 
 static void unload_driver_service(const char *svcName) {
@@ -755,48 +764,25 @@ static void cleanup_prev_svc_tag(void) {
     unload_driver_service("CEDRIVER64");
 }
 
-/* ===== CODE INTEGRITY HELPERS ===== */
+/* ===== CODE INTEGRITY ===== */
 typedef struct { ULONG Length; ULONG CodeIntegrityOptions; } SCI_INFO;
-#define SystemCodeIntegrityInformation          103
-#define CODEINTEGRITY_OPTION_TESTSIGN           0x002
-#define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED  0x400
-#define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED   0x800
+#define SystemCodeIntegrityInformation         103
+#define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED 0x400
+#define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED  0x800
 
 static ULONG query_ci_options(void) {
     typedef LONG (WINAPI *NtQSI_t)(ULONG, PVOID, ULONG, PULONG);
     NtQSI_t fn = (NtQSI_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
                                           "NtQuerySystemInformation");
     if (!fn) return 0;
-    SCI_INFO sci = { sizeof(sci), 0 };
-    ULONG ret = 0;
+    SCI_INFO sci = { sizeof(sci), 0 }; ULONG ret = 0;
     if (fn(SystemCodeIntegrityInformation, &sci, sizeof(sci), &ret) != 0) return 0;
     return sci.CodeIntegrityOptions;
-}
-
-static BOOL is_test_signing_active(void) {
-    return (query_ci_options() & CODEINTEGRITY_OPTION_TESTSIGN) != 0;
 }
 
 static BOOL is_hvci_running(void) {
     ULONG opt = query_ci_options();
     return (opt & (CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED | CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED)) != 0;
-}
-
-/* Enable test signing via bcdedit (Secure Boot must be OFF). Requires reboot. */
-static BOOL enable_test_signing(void) {
-    char bcdedit[MAX_PATH];
-    ExpandEnvironmentStringsA("%SystemRoot%\\System32\\bcdedit.exe", bcdedit, sizeof(bcdedit));
-    char cmd[MAX_PATH + 32];
-    snprintf(cmd, sizeof(cmd), "\"%s\" /set testsigning on", bcdedit);
-    STARTUPINFOA si = {0}; si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        return FALSE;
-    WaitForSingleObject(pi.hProcess, 10000);
-    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    return code == 0;
 }
 
 /* ===== DRIVER BLOCKER CHECKS ===== */
@@ -826,8 +812,7 @@ static DWORD get_sac_state(void) {
 }
 
 static void disable_vdb(void) {
-    DWORD zero = 0;
-    HKEY hk;
+    DWORD zero = 0; HKEY hk;
     if (RegCreateKeyExA(HKEY_LOCAL_MACHINE,
             "SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
@@ -837,8 +822,7 @@ static void disable_vdb(void) {
 }
 
 static void disable_defender_rt(void) {
-    DWORD one = 1;
-    HKEY hk;
+    DWORD one = 1; HKEY hk;
     if (RegCreateKeyExA(HKEY_LOCAL_MACHINE,
             "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
@@ -862,8 +846,7 @@ static void restore_defender_rt(void) {
 }
 
 static void try_disable_hvci(void) {
-    DWORD zero = 0;
-    HKEY hk;
+    DWORD zero = 0; HKEY hk;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
             "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\"
             "Scenarios\\HypervisorEnforcedCodeIntegrity",
@@ -921,7 +904,7 @@ static BOOL check_driver_blockers(void) {
     return FALSE;
 }
 
-/* ===== STEALTH PATCH HELPERS ===== */
+/* ===== FILE HELPERS ===== */
 static BOOL file_read_all(const char *path, BYTE **out, DWORD *sz) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, 0, NULL);
@@ -931,8 +914,7 @@ static BOOL file_read_all(const char *path, BYTE **out, DWORD *sz) {
     *out = (BYTE*)malloc(*sz);
     if (!*out) { CloseHandle(h); return FALSE; }
     DWORD rd = 0; ReadFile(h, *out, *sz, &rd, NULL);
-    CloseHandle(h);
-    *sz = rd;
+    CloseHandle(h); *sz = rd;
     return rd > 0;
 }
 
@@ -1021,8 +1003,7 @@ static void patch_exe_icon(const char *exePath, const char *icoPath) {
     if (sz == INVALID_FILE_SIZE || sz < 6) { CloseHandle(hFile); return; }
     BYTE *ico = (BYTE*)malloc(sz);
     if (!ico) { CloseHandle(hFile); return; }
-    DWORD rd = 0;
-    ReadFile(hFile, ico, sz, &rd, NULL);
+    DWORD rd = 0; ReadFile(hFile, ico, sz, &rd, NULL);
     CloseHandle(hFile);
     if (rd < 6) { free(ico); return; }
     WORD count = *(WORD*)(ico + 4);
@@ -1107,8 +1088,7 @@ static BOOL is_admin(void) {
     BOOL admin = FALSE;
     HANDLE hTok = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) return FALSE;
-    TOKEN_ELEVATION te = {0};
-    DWORD sz = 0;
+    TOKEN_ELEVATION te = {0}; DWORD sz = 0;
     if (GetTokenInformation(hTok, TokenElevation, &te, sizeof(te), &sz))
         admin = te.TokenIsElevated;
     CloseHandle(hTok);
@@ -1136,7 +1116,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     }
 
     get_hwid(g_hwid, sizeof(g_hwid));
-
     if (!prompt_key(hInst)) return 0;
 
     cleanup_prev_svc_tag();
@@ -1161,14 +1140,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     char ce[MAX_PATH], drv[MAX_PATH], ct[MAX_PATH], dse[MAX_PATH],
          deps[MAX_PATH], ico[MAX_PATH], lnv[MAX_PATH], ts[MAX_PATH];
-    snprintf(ce,   sizeof(ce),   "%s\\" CE_PROC_NAME,     dir);
-    snprintf(drv,  sizeof(drv),  "%s\\WinDiag64.sys",     dir);
-    snprintf(ct,   sizeof(ct),   "%s\\cache.ct",          dir);
-    snprintf(dse,  sizeof(dse),  "%s\\dsepatch.exe",      dir);
-    snprintf(deps, sizeof(deps), "%s\\ce_deps.zip",       dir);
-    snprintf(ico,  sizeof(ico),  "%s\\icon.ico",          dir);
-    snprintf(lnv,  sizeof(lnv),  "%s\\LnvMSRIO.sys",     dir);
-    snprintf(ts,   sizeof(ts),   "%s\\ThrottleStop.sys",  dir);
+    snprintf(ce,   sizeof(ce),   "%s\\" CE_PROC_NAME,    dir);
+    snprintf(drv,  sizeof(drv),  "%s\\WinDiag64.sys",    dir);
+    snprintf(ct,   sizeof(ct),   "%s\\cache.ct",         dir);
+    snprintf(dse,  sizeof(dse),  "%s\\dsepatch.exe",     dir);
+    snprintf(deps, sizeof(deps), "%s\\ce_deps.zip",      dir);
+    snprintf(ico,  sizeof(ico),  "%s\\icon.ico",         dir);
+    snprintf(lnv,  sizeof(lnv),  "%s\\LnvMSRIO.sys",    dir);
+    snprintf(ts,   sizeof(ts),   "%s\\ThrottleStop.sys", dir);
 
     gen_stealth_tag();
 
@@ -1180,11 +1159,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
         char _em[256]; snprintf(_em,sizeof(_em),"Step failed: %s\nError: %lu",label,GetLastError()); \
         MessageBoxA(NULL,_em,"BOBS D2 MENU",MB_ICONERROR); goto clean; } } while(0)
 
-    CHK(extract_res_stealthed(hInst,RES_CE_EXE, ce),    "extract " CE_PROC_NAME);
-    CHK(extract_res_stealthed(hInst,RES_DRIVER, drv),   "extract WinDiag64.sys");
-    CHK(extract_res(hInst,RES_CT_FILE, ct),              "extract trainer.ct");
-    CHK(extract_res(hInst,RES_DSE_EXE, dse),             "extract dsepatch.exe");
-    CHK(extract_res(hInst,RES_CE_DEPS, deps),            "extract ce_deps.zip");
+    CHK(extract_res_stealthed(hInst,RES_CE_EXE, ce),   "extract " CE_PROC_NAME);
+    CHK(extract_res_stealthed(hInst,RES_DRIVER, drv),  "extract WinDiag64.sys");
+    CHK(extract_res(hInst,RES_CT_FILE, ct),             "extract trainer.ct");
+    CHK(extract_res(hInst,RES_DSE_EXE, dse),            "extract dsepatch.exe");
+    CHK(extract_res(hInst,RES_CE_DEPS, deps),           "extract ce_deps.zip");
     extract_res(hInst, RES_BIN_ICON, ico);
     extract_res_stealthed(hInst, RES_LNV_DRV, lnv);
     extract_res_stealthed(hInst, RES_TS_DRV,  ts);
@@ -1198,111 +1177,62 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     spoof_hwid();
 
-    /*
-     * DSE bypass strategy:
-     *   1. If test signing is already active (bit 0x2 in CI options) —
-     *      skip the software DSE tool entirely, load driver directly.
-     *   2. Otherwise run the software DSE bypass tool (-off).
-     *   3. If the driver still fails to load — the bypass silently failed.
-     *      Enable bcdedit test signing (needs one reboot, safe with Secure Boot off)
-     *      and prompt the user. Next run hits path 1 automatically.
-     */
-    BOOL testSignOn = is_test_signing_active();
-    BOOL usedDseTool = FALSE;
-
-    if (!testSignOn) {
-        DWORD dseErr = run_dse(dse, 0);
-        if (dseErr == 3) {
-            MessageBoxA(NULL,
-                "Windows is permanently blocking the driver on this build.\n\n"
-                "WDAC base policy is blocking kernel driver load.\n\n"
-                "To fix:\n"
-                "  1. Windows Security -> Device Security -> Core isolation\n"
-                "     Turn OFF 'Memory integrity' if shown ON, then restart\n"
-                "  2. In PowerShell (admin):\n"
-                "       bcdedit /set hypervisorlaunchtype off\n"
-                "       bcdedit /set vsmlaunchtype off\n"
-                "     Then restart and run again",
-                "BOBS D2 MENU - Driver Permanently Blocked", MB_ICONERROR);
-            goto clean;
-        }
-        if (dseErr == 2) {
-            HANDLE hTok = NULL;
-            if (OpenProcessToken(GetCurrentProcess(),
-                                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
-                TOKEN_PRIVILEGES tp = {1};
-                LookupPrivilegeValueA(NULL, "SeShutdownPrivilege",
-                                      &tp.Privileges[0].Luid);
-                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
-                CloseHandle(hTok);
-            }
-            int choice = MessageBoxA(NULL,
-                "A one-time driver compatibility fix was applied.\n\n"
-                "Your PC needs to restart once to take effect.\n"
-                "After that it will work every session with no restart needed.\n\n"
-                "Click OK to reboot now, or Cancel to reboot manually.",
-                "BOBS D2 MENU - Reboot Required", MB_OKCANCEL | MB_ICONINFORMATION);
-            if (choice == IDOK)
-                InitiateSystemShutdownExA(NULL,
-                    "BOBS D2 MENU applied a driver fix. Rebooting...",
-                    10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
-            goto clean;
-        }
-        usedDseTool = TRUE;
-        Sleep(600);
+    /* DSE bypass: pipe "yes" to stdin so the tool auto-confirms the patch */
+    DWORD dseErr = run_dse(dse, 0);
+    if (dseErr == 3) {
+        MessageBoxA(NULL,
+            "Windows is permanently blocking the driver on this build.\n\n"
+            "WDAC base policy is blocking kernel driver load.\n\n"
+            "To fix:\n"
+            "  1. Windows Security -> Device Security -> Core isolation\n"
+            "     Turn OFF 'Memory integrity' if shown ON, then restart\n"
+            "  2. In PowerShell (admin):\n"
+            "       bcdedit /set hypervisorlaunchtype off\n"
+            "       bcdedit /set vsmlaunchtype off\n"
+            "     Then restart and run again",
+            "BOBS D2 MENU - Driver Permanently Blocked", MB_ICONERROR);
+        goto clean;
     }
+    if (dseErr == 2) {
+        HANDLE hTok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(),
+                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
+            TOKEN_PRIVILEGES tp = {1};
+            LookupPrivilegeValueA(NULL, "SeShutdownPrivilege", &tp.Privileges[0].Luid);
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
+            CloseHandle(hTok);
+        }
+        int choice = MessageBoxA(NULL,
+            "A one-time driver compatibility fix was applied.\n\n"
+            "Your PC needs to restart once to take effect.\n"
+            "After that it will work every session with no restart needed.\n\n"
+            "Click OK to reboot now, or Cancel to reboot manually.",
+            "BOBS D2 MENU - Reboot Required", MB_OKCANCEL | MB_ICONINFORMATION);
+        if (choice == IDOK)
+            InitiateSystemShutdownExA(NULL,
+                "BOBS D2 MENU applied a driver fix. Rebooting...",
+                10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
+        goto clean;
+    }
+
+    /* Give the kernel patch a moment to settle */
+    Sleep(500);
 
     if (!load_driver_service(drv, g_stealth_tag)) {
         DWORD loadErr = GetLastError();
-
-        if (!testSignOn) {
-            /* Software DSE bypass returned success but driver still rejected.
-               Enable test signing via bcdedit — requires one reboot, then works permanently. */
-            BOOL tsOk = enable_test_signing();
-            char msg[512];
-            if (tsOk) {
-                snprintf(msg, sizeof(msg),
-                    "The software DSE bypass failed (driver error %lu).\n\n"
-                    "Test signing mode has been enabled as a reliable fallback.\n"
-                    "This is a ONE-TIME setup — just restart once and it works every time.\n\n"
-                    "Click OK to reboot now, or Cancel to do it manually.",
-                    loadErr);
-                int choice = MessageBoxA(NULL, msg, "BOBS D2 MENU - Reboot Required",
-                                         MB_OKCANCEL | MB_ICONINFORMATION);
-                if (choice == IDOK) {
-                    HANDLE hTok = NULL;
-                    if (OpenProcessToken(GetCurrentProcess(),
-                                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
-                        TOKEN_PRIVILEGES tp = {1};
-                        LookupPrivilegeValueA(NULL, "SeShutdownPrivilege",
-                                              &tp.Privileges[0].Luid);
-                        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-                        AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
-                        CloseHandle(hTok);
-                    }
-                    InitiateSystemShutdownExA(NULL,
-                        "BOBS D2 MENU: enabling driver support mode...",
-                        10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
-                }
-            } else {
-                snprintf(msg, sizeof(msg),
-                    "Failed to load driver (error %lu) and bcdedit also failed.\n\n"
-                    "Run manually in admin PowerShell:\n"
-                    "  bcdedit /set testsigning on\n"
-                    "Then restart and run again.",
-                    loadErr);
-                MessageBoxA(NULL, msg, "BOBS D2 MENU - Manual Fix Required", MB_ICONERROR);
-            }
-        } else {
-            /* Test signing is on but driver still failed — driver binary issue */
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                "Driver load failed (error %lu) even with test signing active.\n\n"
-                "The driver binary may be corrupted. Please re-download.",
-                loadErr);
-            MessageBoxA(NULL, msg, "BOBS D2 MENU - Driver Error", MB_ICONERROR);
-        }
+        char errMsg[512];
+        const char *hint = "";
+        if      (loadErr == 1275) hint = "\nError 1275 = DRIVER_BLOCKED: WDAC/Secure Boot policy blocking driver.";
+        else if (loadErr == 577)  hint = "\nError 577 = INVALID_IMAGE_HASH: driver signature check failed.";
+        else if (loadErr == 5)    hint = "\nError 5 = ACCESS_DENIED: run as Administrator.";
+        else if (loadErr == 31)   hint = "\nError 31 = GEN_FAILURE: DSE still active or driver init failed.";
+        else if (loadErr == 1058) hint = "\nError 1058 = SERVICE_DISABLED.";
+        snprintf(errMsg, sizeof(errMsg),
+            "Failed to load kernel driver (Win32 error %lu).%s\n\n"
+            "DSE tool exit code: %lu",
+            loadErr, hint, dseErr);
+        MessageBoxA(NULL, errMsg, "BOBS D2 MENU - Driver Load Failed", MB_ICONERROR);
         goto clean;
     }
 
@@ -1318,10 +1248,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     Sleep(4000);
     DeleteFileA(ct);
 
-    /* Re-enable DSE only if we used the software bypass */
-    if (usedDseTool)
-        run_dse(dse, 1);
-
+    /* Re-enable DSE while the game is loading (driver already live, CE has the handle) */
+    run_dse(dse, 1);
     restore_defender_rt();
 
     if (hCE != INVALID_HANDLE_VALUE) {
