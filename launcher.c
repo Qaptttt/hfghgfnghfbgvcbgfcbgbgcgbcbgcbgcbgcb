@@ -1,9 +1,5 @@
 /*
  * BOBS D2 MENU — Launcher v2.0
- * Dark-themed auth window + System Locker key validation
- * Flow: dark auth prompt -> SL validate -> extract files -> DSE bypass
- *       -> load DBK driver ourselves -> launch CE (nosplash) with CT
- *       -> DSE re-enable -> wait -> cleanup
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -684,14 +680,11 @@ static DWORD run_dse(const char *exe, int reenable) {
     return code;
 }
 
-/* ===== DRIVER LOAD / UNLOAD VIA SCM =====
-   Load the driver ourselves before CE starts so CE just opens the
-   already-running device instead of trying to load it itself. */
+/* ===== DRIVER LOAD / UNLOAD VIA SCM ===== */
 static BOOL load_driver_service(const char *drvPath, const char *svcName) {
     SC_HANDLE hScm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!hScm) return FALSE;
 
-    /* Delete any stale entry with this name */
     SC_HANDLE hSvc = OpenServiceA(hScm, svcName, SERVICE_ALL_ACCESS);
     if (hSvc) {
         SERVICE_STATUS ss = {0};
@@ -738,7 +731,6 @@ static void unload_driver_service(const char *svcName) {
     CloseServiceHandle(hScm);
 }
 
-/* Save/load the current session's service tag for cleanup on next launch */
 #define REG_TAG_KEY  "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartPage2"
 #define REG_TAG_VAL  "MonitoredApps"
 static void save_svc_tag(const char *tag) {
@@ -758,31 +750,56 @@ static void cleanup_prev_svc_tag(void) {
         RegDeleteValueA(hk, REG_TAG_VAL);
         RegCloseKey(hk);
     }
-    /* Clean up legacy names from old installs */
     unload_driver_service("DBK64");
     unload_driver_service("DBK32");
     unload_driver_service("CEDRIVER64");
 }
 
-/* ===== DRIVER BLOCKER CHECKS ===== */
+/* ===== CODE INTEGRITY HELPERS ===== */
 typedef struct { ULONG Length; ULONG CodeIntegrityOptions; } SCI_INFO;
-#define SystemCodeIntegrityInformation 103
-#define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED 0x400
-#define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED  0x800
+#define SystemCodeIntegrityInformation          103
+#define CODEINTEGRITY_OPTION_TESTSIGN           0x002
+#define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED  0x400
+#define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED   0x800
 
-static BOOL is_hvci_running(void) {
+static ULONG query_ci_options(void) {
     typedef LONG (WINAPI *NtQSI_t)(ULONG, PVOID, ULONG, PULONG);
-    NtQSI_t NtQSI = (NtQSI_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
-                                              "NtQuerySystemInformation");
-    if (!NtQSI) return FALSE;
+    NtQSI_t fn = (NtQSI_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                          "NtQuerySystemInformation");
+    if (!fn) return 0;
     SCI_INFO sci = { sizeof(sci), 0 };
     ULONG ret = 0;
-    if (NtQSI(SystemCodeIntegrityInformation, &sci, sizeof(sci), &ret) != 0)
-        return FALSE;
-    return (sci.CodeIntegrityOptions &
-            (CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED | CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED)) != 0;
+    if (fn(SystemCodeIntegrityInformation, &sci, sizeof(sci), &ret) != 0) return 0;
+    return sci.CodeIntegrityOptions;
 }
 
+static BOOL is_test_signing_active(void) {
+    return (query_ci_options() & CODEINTEGRITY_OPTION_TESTSIGN) != 0;
+}
+
+static BOOL is_hvci_running(void) {
+    ULONG opt = query_ci_options();
+    return (opt & (CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED | CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED)) != 0;
+}
+
+/* Enable test signing via bcdedit (Secure Boot must be OFF). Requires reboot. */
+static BOOL enable_test_signing(void) {
+    char bcdedit[MAX_PATH];
+    ExpandEnvironmentStringsA("%SystemRoot%\\System32\\bcdedit.exe", bcdedit, sizeof(bcdedit));
+    char cmd[MAX_PATH + 32];
+    snprintf(cmd, sizeof(cmd), "\"%s\" /set testsigning on", bcdedit);
+    STARTUPINFOA si = {0}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return FALSE;
+    WaitForSingleObject(pi.hProcess, 10000);
+    DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return code == 0;
+}
+
+/* ===== DRIVER BLOCKER CHECKS ===== */
 static BOOL is_hvci_enabled(void) {
     if (!is_hvci_running()) return FALSE;
     HKEY hk; DWORD val = 0, sz = sizeof(val);
@@ -851,8 +868,8 @@ static void try_disable_hvci(void) {
             "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\"
             "Scenarios\\HypervisorEnforcedCodeIntegrity",
             0, KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
-        RegSetValueExA(hk, "Enabled",            0, REG_DWORD, (BYTE*)&zero, sizeof(zero));
-        RegSetValueExA(hk, "WasEnabledBy",       0, REG_DWORD, (BYTE*)&zero, sizeof(zero));
+        RegSetValueExA(hk, "Enabled",      0, REG_DWORD, (BYTE*)&zero, sizeof(zero));
+        RegSetValueExA(hk, "WasEnabledBy", 0, REG_DWORD, (BYTE*)&zero, sizeof(zero));
         RegCloseKey(hk);
     }
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
@@ -1122,7 +1139,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     if (!prompt_key(hInst)) return 0;
 
-    /* Clean up any driver service left from a previous crashed/killed run */
     cleanup_prev_svc_tag();
 
     char base[MAX_PATH], dir[MAX_PATH];
@@ -1156,7 +1172,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     gen_stealth_tag();
 
-    /* Kill AV BEFORE anything touches disk */
     disable_defender_rt();
     disable_vdb();
     Sleep(1500);
@@ -1183,70 +1198,115 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     spoof_hwid();
 
-    DWORD dseErr = run_dse(dse, 0);
-    if (dseErr == 3) {
-        MessageBoxA(NULL,
-            "Windows is permanently blocking the driver on this build.\n\n"
-            "WDAC base policy is blocking kernel driver load.\n\n"
-            "To fix:\n"
-            "  1. Windows Security -> Device Security -> Core isolation\n"
-            "     Turn OFF 'Memory integrity' if shown ON, then restart\n"
-            "  2. In PowerShell (admin):\n"
-            "       bcdedit /set hypervisorlaunchtype off\n"
-            "       bcdedit /set vsmlaunchtype off\n"
-            "     Then restart and run again",
-            "BOBS D2 MENU - Driver Permanently Blocked", MB_ICONERROR);
-        goto clean;
-    }
-    if (dseErr == 2) {
-        HANDLE hTok = NULL;
-        if (OpenProcessToken(GetCurrentProcess(),
-                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
-            TOKEN_PRIVILEGES tp = {1};
-            LookupPrivilegeValueA(NULL, "SeShutdownPrivilege",
-                                  &tp.Privileges[0].Luid);
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
-            CloseHandle(hTok);
-        }
-        int choice = MessageBoxA(NULL,
-            "A one-time driver compatibility fix was applied.\n\n"
-            "Your PC needs to restart once to take effect.\n"
-            "After that it will work every session with no restart needed.\n\n"
-            "Click OK to reboot now, or Cancel to reboot manually.",
-            "BOBS D2 MENU - Reboot Required", MB_OKCANCEL | MB_ICONINFORMATION);
-        if (choice == IDOK)
-            InitiateSystemShutdownExA(NULL,
-                "BOBS D2 MENU applied a driver fix. Rebooting...",
-                10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
-        goto clean;
-    }
-    Sleep(400);
+    /*
+     * DSE bypass strategy:
+     *   1. If test signing is already active (bit 0x2 in CI options) —
+     *      skip the software DSE tool entirely, load driver directly.
+     *   2. Otherwise run the software DSE bypass tool (-off).
+     *   3. If the driver still fails to load — the bypass silently failed.
+     *      Enable bcdedit test signing (needs one reboot, safe with Secure Boot off)
+     *      and prompt the user. Next run hits path 1 automatically.
+     */
+    BOOL testSignOn = is_test_signing_active();
+    BOOL usedDseTool = FALSE;
 
-    /* Load the kernel driver ourselves via SCM before CE starts */
+    if (!testSignOn) {
+        DWORD dseErr = run_dse(dse, 0);
+        if (dseErr == 3) {
+            MessageBoxA(NULL,
+                "Windows is permanently blocking the driver on this build.\n\n"
+                "WDAC base policy is blocking kernel driver load.\n\n"
+                "To fix:\n"
+                "  1. Windows Security -> Device Security -> Core isolation\n"
+                "     Turn OFF 'Memory integrity' if shown ON, then restart\n"
+                "  2. In PowerShell (admin):\n"
+                "       bcdedit /set hypervisorlaunchtype off\n"
+                "       bcdedit /set vsmlaunchtype off\n"
+                "     Then restart and run again",
+                "BOBS D2 MENU - Driver Permanently Blocked", MB_ICONERROR);
+            goto clean;
+        }
+        if (dseErr == 2) {
+            HANDLE hTok = NULL;
+            if (OpenProcessToken(GetCurrentProcess(),
+                                 TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
+                TOKEN_PRIVILEGES tp = {1};
+                LookupPrivilegeValueA(NULL, "SeShutdownPrivilege",
+                                      &tp.Privileges[0].Luid);
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
+                CloseHandle(hTok);
+            }
+            int choice = MessageBoxA(NULL,
+                "A one-time driver compatibility fix was applied.\n\n"
+                "Your PC needs to restart once to take effect.\n"
+                "After that it will work every session with no restart needed.\n\n"
+                "Click OK to reboot now, or Cancel to reboot manually.",
+                "BOBS D2 MENU - Reboot Required", MB_OKCANCEL | MB_ICONINFORMATION);
+            if (choice == IDOK)
+                InitiateSystemShutdownExA(NULL,
+                    "BOBS D2 MENU applied a driver fix. Rebooting...",
+                    10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
+            goto clean;
+        }
+        usedDseTool = TRUE;
+        Sleep(600);
+    }
+
     if (!load_driver_service(drv, g_stealth_tag)) {
         DWORD loadErr = GetLastError();
-        char errMsg[512];
-        const char *hint = "";
-        if      (loadErr == 1275) hint = "\nError 1275 = DRIVER_BLOCKED: WDAC/Secure Boot policy is blocking this driver.";
-        else if (loadErr == 577)  hint = "\nError 577 = INVALID_IMAGE_HASH: driver signature check failed. DSE bypass may not have worked.";
-        else if (loadErr == 5)    hint = "\nError 5 = ACCESS_DENIED: run as Administrator.";
-        else if (loadErr == 2)    hint = "\nError 2 = FILE_NOT_FOUND: driver file path wrong.";
-        else if (loadErr == 1058) hint = "\nError 1058 = SERVICE_DISABLED.";
-        snprintf(errMsg, sizeof(errMsg),
-            "Failed to load kernel driver (Win32 error %lu).%s\n\n"
-            "DSE tool exit code: %lu\n\n"
-            "Confirm:\n"
-            "  Memory Integrity (HVCI) = OFF\n"
-            "  Smart App Control = OFF\n"
-            "  Secure Boot = OFF (or test signing on)",
-            loadErr, hint, dseErr);
-        MessageBoxA(NULL, errMsg, "BOBS D2 MENU - Driver Load Failed", MB_ICONERROR);
+
+        if (!testSignOn) {
+            /* Software DSE bypass returned success but driver still rejected.
+               Enable test signing via bcdedit — requires one reboot, then works permanently. */
+            BOOL tsOk = enable_test_signing();
+            char msg[512];
+            if (tsOk) {
+                snprintf(msg, sizeof(msg),
+                    "The software DSE bypass failed (driver error %lu).\n\n"
+                    "Test signing mode has been enabled as a reliable fallback.\n"
+                    "This is a ONE-TIME setup — just restart once and it works every time.\n\n"
+                    "Click OK to reboot now, or Cancel to do it manually.",
+                    loadErr);
+                int choice = MessageBoxA(NULL, msg, "BOBS D2 MENU - Reboot Required",
+                                         MB_OKCANCEL | MB_ICONINFORMATION);
+                if (choice == IDOK) {
+                    HANDLE hTok = NULL;
+                    if (OpenProcessToken(GetCurrentProcess(),
+                                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok)) {
+                        TOKEN_PRIVILEGES tp = {1};
+                        LookupPrivilegeValueA(NULL, "SeShutdownPrivilege",
+                                              &tp.Privileges[0].Luid);
+                        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                        AdjustTokenPrivileges(hTok, FALSE, &tp, 0, NULL, NULL);
+                        CloseHandle(hTok);
+                    }
+                    InitiateSystemShutdownExA(NULL,
+                        "BOBS D2 MENU: enabling driver support mode...",
+                        10, FALSE, TRUE, SHTDN_REASON_MAJOR_APPLICATION);
+                }
+            } else {
+                snprintf(msg, sizeof(msg),
+                    "Failed to load driver (error %lu) and bcdedit also failed.\n\n"
+                    "Run manually in admin PowerShell:\n"
+                    "  bcdedit /set testsigning on\n"
+                    "Then restart and run again.",
+                    loadErr);
+                MessageBoxA(NULL, msg, "BOBS D2 MENU - Manual Fix Required", MB_ICONERROR);
+            }
+        } else {
+            /* Test signing is on but driver still failed — driver binary issue */
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "Driver load failed (error %lu) even with test signing active.\n\n"
+                "The driver binary may be corrupted. Please re-download.",
+                loadErr);
+            MessageBoxA(NULL, msg, "BOBS D2 MENU - Driver Error", MB_ICONERROR);
+        }
         goto clean;
     }
 
     save_svc_tag(g_stealth_tag);
-
     ce_prep(dir);
 
     char ctArg[MAX_PATH+64];
@@ -1257,7 +1317,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 
     Sleep(4000);
     DeleteFileA(ct);
-    run_dse(dse, 1);
+
+    /* Re-enable DSE only if we used the software bypass */
+    if (usedDseTool)
+        run_dse(dse, 1);
+
     restore_defender_rt();
 
     if (hCE != INVALID_HANDLE_VALUE) {
