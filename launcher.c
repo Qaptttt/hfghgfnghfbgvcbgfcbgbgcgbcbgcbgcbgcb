@@ -10,6 +10,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <winhttp.h>
 #include <tlhelp32.h>
@@ -684,9 +685,8 @@ static DWORD run_dse(const char *exe, int reenable) {
 }
 
 /* ===== DRIVER LOAD / UNLOAD VIA SCM =====
-   We load the driver ourselves before CE starts so CE just opens the
-   already-running device instead of trying to load it itself.
-   svcName = g_stealth_tag (same name CE will look for after our patch). */
+   Load the driver ourselves before CE starts so CE just opens the
+   already-running device instead of trying to load it itself. */
 static BOOL load_driver_service(const char *drvPath, const char *svcName) {
     SC_HANDLE hScm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!hScm) return FALSE;
@@ -738,7 +738,7 @@ static void unload_driver_service(const char *svcName) {
     CloseServiceHandle(hScm);
 }
 
-/* Save/load the current session's service tag so we can clean it up on next launch */
+/* Save/load the current session's service tag for cleanup on next launch */
 #define REG_TAG_KEY  "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartPage2"
 #define REG_TAG_VAL  "MonitoredApps"
 static void save_svc_tag(const char *tag) {
@@ -758,7 +758,7 @@ static void cleanup_prev_svc_tag(void) {
         RegDeleteValueA(hk, REG_TAG_VAL);
         RegCloseKey(hk);
     }
-    /* Also always clean up known legacy names in case of old install */
+    /* Clean up legacy names from old installs */
     unload_driver_service("DBK64");
     unload_driver_service("DBK32");
     unload_driver_service("CEDRIVER64");
@@ -1177,15 +1177,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     CHK(unzip_to_dir(deps, dir), "unzip ce_deps.zip");
     DeleteFileA(deps);
 
-    /* Patch DBK device name strings in CE binary */
     stealth_patch(ce);
 
-    /* Check for hard blockers (HVCI, SAC) before wasting time on DSE */
     if (check_driver_blockers()) goto clean;
 
     spoof_hwid();
 
-    /* Run DSE bypass tool */
     DWORD dseErr = run_dse(dse, 0);
     if (dseErr == 3) {
         MessageBoxA(NULL,
@@ -1226,14 +1223,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
     }
     Sleep(400);
 
-    /* Load the kernel driver ourselves via SCM.
-       This bypasses CE's own load mechanism entirely.
-       CE will find the device already open and skip its load attempt. */
+    /* Load the kernel driver ourselves via SCM before CE starts */
     if (!load_driver_service(drv, g_stealth_tag)) {
         DWORD loadErr = GetLastError();
         char errMsg[512];
         const char *hint = "";
-        if      (loadErr == 1275) hint = "\nError 1275 = DRIVER_BLOCKED: WDAC/Secure Boot policy is blocking this driver.\nTurn off Secure Boot in BIOS or enable test signing.";
+        if      (loadErr == 1275) hint = "\nError 1275 = DRIVER_BLOCKED: WDAC/Secure Boot policy is blocking this driver.";
         else if (loadErr == 577)  hint = "\nError 577 = INVALID_IMAGE_HASH: driver signature check failed. DSE bypass may not have worked.";
         else if (loadErr == 5)    hint = "\nError 5 = ACCESS_DENIED: run as Administrator.";
         else if (loadErr == 2)    hint = "\nError 2 = FILE_NOT_FOUND: driver file path wrong.";
@@ -1250,7 +1245,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
         goto clean;
     }
 
-    /* Save tag so we can clean up on next run if we crash */
     save_svc_tag(g_stealth_tag);
 
     ce_prep(dir);
@@ -1274,7 +1268,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lp, int nShow) {
 clean:
     kill_by_name(L"dsepatch.exe");
     unload_driver_service(g_stealth_tag);
-    /* Clear saved tag since we cleaned up successfully */
     { HKEY hk;
       if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_TAG_KEY, 0, KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
           RegDeleteValueA(hk, REG_TAG_VAL);
